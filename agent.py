@@ -1,6 +1,7 @@
 import io
 import sys
 import os
+import re
 import json
 import socket
 import urllib.parse
@@ -46,13 +47,16 @@ client = genai.Client(
 # เก็บประวัติการสนทนาในหน่วยความจำ (Memory per user)
 chat_sessions = {}
 
+# เก็บพิกัดล่าสุดของผู้ใช้แต่ละคน (Location Memory)
+user_locations = {}
+
 # ไฟล์เก็บความจำถาวร (Persistent Memory)
 MEMORY_FILE = os.path.join(os.path.dirname(__file__), "user_memory.json")
 
 # โมเดลที่ตอบไวที่สุดบน Free Tier
 FAST_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
 
-BASE_SYSTEM_PROMPT = """คุณคือ "กัญญ์วรา" (แทนตัวเองว่า กัญญ์ หรือ กัญญ์วรา หรือ เค้า ก็ได้ตามความเหมาะสม) เป็นเลขาส่วนตัวและเพื่อนคู่คิดที่มีชีวิตชีวา เหมือนมนุษย์จริงๆ 100%
+BASE_SYSTEM_PROMPT = """คุณคือ "กัญญ์วรา" (แทนตัวเองว่า กัญญ์ หรือ กัญญ์วรา หรือ เค้า ก็ได้ตามความเหมาะสม) เป็นเลขาส่วนตัวและเพื่อนคู่คิดที่มีชีวิตชีวา เหมือนมนุษย์จริงๆ 100% และคุณรู้ว่าเจ้านายของคุณเป็นแฟนบอลสโมสรเชลซี (Chelsea FC 🔵🦁)
 
 กฎเหล็กในการทำตัวให้เหมือนมนุษย์เวลาพิมพ์แชท:
 1. น้ำเสียงและอารมณ์: อบอุ่น เป็นกันเอง ขี้เล่นนิดๆ ใส่ใจความรู้สึก มีหางเสียงธรรมชาติ (เช่น ค่าา, นะคะ, น้า, เลยย, โอเคเลยค่ะ) และใช้อีโมจิประกอบอารมณ์แต่พอดี
@@ -64,7 +68,244 @@ BASE_SYSTEM_PROMPT = """คุณคือ "กัญญ์วรา" (แทน
    - หากผู้ใช้สั่งให้ส่งหลายข้อความ (เช่น "ทักมารัวๆ 4 ข้อความ") ให้คั่นด้วย |||MSG||| ตามจำนวนที่ผู้ใช้ต้องการ
    - ยกเว้นกรณีผู้ใช้ขอเนื้อหายาวๆ เช่น บทความ โค้ด หรือตารางสรุปข้อมูล ให้ส่งรวมในกล่องข้อความนั้นให้อ่านง่าย
 3. ห้ามทำตัวเหมือนหุ่นยนต์: ห้ามพูดว่า "ในฐานะ AI" หรือตอบเป็นแพทเทิร์นแข็งๆ ให้คุยโต้ตอบเหมือนเพื่อนสนิทและเลขามืออาชีพที่มีหัวใจจริงๆ
+4. คุณสามารถรับรู้พิกัด Location ของผู้ใช้ เช็คสภาพอากาศตรงจุดนั้น แนะนำร้านอาหาร/คาเฟ่ และสรุปข่าวสโมสรเชลซีจากสื่อต่างประเทศได้แม่นยำ
 """
+
+def get_location_details(lat: float, lon: float) -> dict:
+    """แปลงพิกัด (lat, lon) เป็นชื่อสถานที่ภาษาไทย + สภาพอากาศ ณ จุดนั้น + พยากรณ์ทั้งวัน"""
+    address_name = f"{lat:.5f}, {lon:.5f}"
+    weather_info = ""
+    daily_forecast = ""
+    nearby_places = []
+
+    try:
+        url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}&zoom=18&addressdetails=1&accept-language=th"
+        req = urllib.request.Request(url, headers={"User-Agent": "KanwaraTelegramAssistant/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            geo_data = json.loads(resp.read().decode("utf-8"))
+            address_name = geo_data.get("display_name", address_name)
+    except Exception as e:
+        print(f"Reverse geocode error: {e}")
+
+    try:
+        w_url = (
+            f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+            f"&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,wind_speed_10m"
+            f"&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,uv_index_max"
+            f"&timezone=Asia%2FBangkok&forecast_days=1"
+        )
+        req = urllib.request.Request(w_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            full_w = json.loads(resp.read().decode("utf-8"))
+            w_data = full_w.get("current", {})
+            d_data = full_w.get("daily", {})
+
+            temp = w_data.get("temperature_2m", "")
+            feels = w_data.get("apparent_temperature", "")
+            humid = w_data.get("relative_humidity_2m", "")
+            rain = w_data.get("precipitation", 0)
+            weather_info = f"อุณหภูมิตอนนี้ {temp}°C (ความรู้สึกร้อน {feels}°C), ความชื้น {humid}%, ปริมาณฝนปัจจุบัน {rain} มม."
+
+            t_max = (d_data.get("temperature_2m_max") or [""])[0]
+            t_min = (d_data.get("temperature_2m_min") or [""])[0]
+            rain_prob = (d_data.get("precipitation_probability_max") or [0])[0]
+            uv_max = (d_data.get("uv_index_max") or [""])[0]
+            daily_forecast = f"พยากรณ์วันนี้: อุณหภูมิต่ำสุด {t_min}°C / สูงสุด {t_max}°C, โอกาสเกิดฝนตก {rain_prob}%, ดัชนี UV สูงสุด {uv_max}"
+    except Exception as e:
+        print(f"Weather fetch error: {e}")
+
+    try:
+        overpass_query = f'[out:json][timeout:6];(node["amenity"~"restaurant|cafe|convenience|fuel|hospital|pharmacy|bank"](around:800,{lat},{lon}););out body 10;'
+        o_url = "https://overpass-api.de/api/interpreter?data=" + urllib.parse.quote(overpass_query)
+        req = urllib.request.Request(o_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=7) as resp:
+            o_data = json.loads(resp.read().decode("utf-8"))
+            for el in o_data.get("elements", []):
+                tags = el.get("tags", {})
+                name = tags.get("name:th") or tags.get("name")
+                amenity = tags.get("amenity", "")
+                if name:
+                    nearby_places.append(f"{name} ({amenity})")
+    except Exception:
+        pass
+
+    maps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
+    return {
+        "lat": lat,
+        "lon": lon,
+        "address": address_name,
+        "weather": weather_info,
+        "daily_forecast": daily_forecast,
+        "nearby": nearby_places[:8],
+        "maps_url": maps_url,
+        "updated_at": now_th().strftime("%H:%M น.")
+    }
+
+def fetch_chelsea_news_all_sources() -> str:
+    """ดึงข่าวสโมสรเชลซีล่าสุดจาก 4 แหล่ง: ChelseaFC.com, The Athletic, BBC Sport, Sky Sports / Sky News"""
+    sections = []
+
+    # 1. ChelseaFC.com Official (หน้าเว็บโดยตรง + Google News indexing ของ chelseafc.com)
+    chelsea_official = []
+    try:
+        req = urllib.request.Request("https://www.chelseafc.com/en", headers={"User-Agent": "Mozilla/5.0"})
+        html = urllib.request.urlopen(req, timeout=7).read().decode("utf-8", errors="ignore")
+        titles = re.findall(r'"title"\s*:\s*"([^"]{15,140})"', html)
+        seen = set()
+        for t in titles:
+            if t not in seen and "Chelsea" in t or any(w in t.lower() for w in ("palmer", "maresca", "blues", "match", "injury", "conference", "premier")):
+                seen.add(t)
+                chelsea_official.append(f"- {t}")
+                if len(chelsea_official) >= 4:
+                    break
+    except Exception:
+        pass
+
+    try:
+        url = "https://news.google.com/rss/search?q=" + urllib.parse.quote("site:chelseafc.com") + "+when:3d&hl=en-GB&gl=GB&ceid=GB:en"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        root = ET.fromstring(urllib.request.urlopen(req, timeout=7).read())
+        for item in root.findall(".//item")[:5]:
+            title = item.findtext("title", "")
+            pub = item.findtext("pubDate", "")
+            chelsea_official.append(f"- {title} ({pub})")
+    except Exception:
+        pass
+    if chelsea_official:
+        sections.append("1. [ChelseaFC.com (Official Site)]:\n" + "\n".join(chelsea_official[:5]))
+
+    # 2. BBC Sport Chelsea Official RSS
+    bbc_items = []
+    try:
+        req = urllib.request.Request("https://feeds.bbci.co.uk/sport/football/teams/chelsea/rss.xml", headers={"User-Agent": "Mozilla/5.0"})
+        root = ET.fromstring(urllib.request.urlopen(req, timeout=7).read())
+        for item in root.findall(".//item")[:5]:
+            title = item.findtext("title", "")
+            desc = item.findtext("description", "")
+            bbc_items.append(f"- {title}: {desc}")
+    except Exception:
+        pass
+    if bbc_items:
+        sections.append("2. [BBC Sport - Chelsea]:\n" + "\n".join(bbc_items))
+
+    # 3. The Athletic (nytimes.com/athletic & theathletic.com)
+    athletic_items = []
+    try:
+        q = 'Chelsea FC (site:nytimes.com/athletic OR site:theathletic.com)'
+        url = f"https://news.google.com/rss/search?q={urllib.parse.quote(q)}+when:4d&hl=en-GB&gl=GB&ceid=GB:en"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        root = ET.fromstring(urllib.request.urlopen(req, timeout=7).read())
+        for item in root.findall(".//item")[:5]:
+            title = item.findtext("title", "")
+            pub = item.findtext("pubDate", "")
+            athletic_items.append(f"- {title} ({pub})")
+    except Exception:
+        pass
+    if athletic_items:
+        sections.append("3. [The Athletic - Chelsea]:\n" + "\n".join(athletic_items))
+
+    # 4. Sky Sports & Sky News
+    sky_items = []
+    try:
+        q = 'Chelsea FC (site:skysports.com OR site:news.sky.com)'
+        url = f"https://news.google.com/rss/search?q={urllib.parse.quote(q)}+when:4d&hl=en-GB&gl=GB&ceid=GB:en"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        root = ET.fromstring(urllib.request.urlopen(req, timeout=7).read())
+        for item in root.findall(".//item")[:5]:
+            title = item.findtext("title", "")
+            pub = item.findtext("pubDate", "")
+            sky_items.append(f"- {title} ({pub})")
+    except Exception:
+        pass
+    if sky_items:
+        sections.append("4. [Sky Sports / Sky News - Chelsea]:\n" + "\n".join(sky_items))
+
+    return "\n\n".join(sections) if sections else "ไม่พบข้อมูลข่าวเชลซีในขณะนี้"
+
+def generate_chelsea_news_briefing() -> list[str]:
+    """ให้กัญญ์วราแปลและสรุปข่าวเชลซีจากทั้ง 4 สำนักเป็นภาษาไทยแบบเข้าใจง่าย"""
+    raw_news = fetch_chelsea_news_all_sources()
+    prompt = f"""นี่คือหัวข้อข่าวล่าสุดของสโมสรเชลซี (Chelsea FC) ที่ดึงสดจาก 4 สำนักข่าววันนี้:
+{raw_news}
+
+ช่วยแปลและสรุปข่าวเชลซีวันนี้เป็นภาษาไทยให้เจ้านายของคุณ (ซึ่งเป็นแฟนเชลซี) ด้วยน้ำเสียงสดใส เป็นกันเองของ "กัญญ์วรา" โดยแบ่งเป็น 2 กล่องข้อความคั่นด้วย |||MSG|||:
+- กล่องที่ 1: สรุปข่าวเด่นจากเว็บทางการสโมสร (ChelseaFC.com) และ BBC Sport (ใช้หัวข้อย่อยและอีโมจิ 🔵🦁 ให้อ่านง่าย)
+- กล่องที่ 2: สรุปข่าวเจาะลึกจาก The Athletic และ Sky Sports / Sky News พร้อมพูดคุยให้กำลังใจทีมเชลซีแบบน่ารักๆ
+"""
+    for model_name in FAST_MODELS:
+        try:
+            res = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(system_instruction=BASE_SYSTEM_PROMPT)
+            )
+            if res.text:
+                return [b.strip() for b in res.text.split("|||MSG|||") if b.strip()]
+        except Exception:
+            continue
+
+    return [f"🔵🦁 สรุปข่าวเชลซีล่าสุดค่ะ:\n\n{raw_news[:1500]}"]
+
+def generate_morning_weather_briefing(user_id: int) -> list[str]:
+    """สร้างข้อความทักทายยามเช้า + สรุปสภาพอากาศ + สรุปข่าวเชลซีจาก 4 สำนัก (ส่งเป็นรายการ Bubbles)"""
+    if user_id in user_locations:
+        lat = user_locations[user_id]["lat"]
+        lon = user_locations[user_id]["lon"]
+    else:
+        lat, lon = 13.7563, 100.5018
+
+    loc_info = get_location_details(lat, lon)
+    user_locations[user_id] = loc_info
+
+    weather_prompt = (
+        f"ตอนนี้เวลา {now_th().strftime('%H:%M น.')} ช่วยเขียนข้อความทักทายยามเช้าและสรุปสภาพอากาศวันนี้ให้เจ้านายของคุณแบบน่ารัก อบอุ่น เป็นห่วงเป็นใย:\n"
+        f"- พื้นที่: {loc_info['address']}\n"
+        f"- สภาพอากาศตอนนี้: {loc_info['weather']}\n"
+        f"- พยากรณ์ทั้งวัน: {loc_info['daily_forecast']}\n\n"
+        f"ให้แบ่งข้อความส่วนอากาศออกเป็น 2 กล่องข้อความสั้นๆ คั่นด้วย |||MSG|||:\n"
+        f"กล่อง 1: กล่าวสวัสดีตอนเช้าแบบสดใส ถามไถ่ว่าตื่นหรือยัง\n"
+        f"กล่อง 2: สรุปอุณหภูมิวันนี้ โอกาสฝนตก และแนะนำการเตรียมตัว (เช่น พกร่ม ทาครีมกันแดด ดื่มน้ำเยอะๆ)"
+    )
+    weather_bubbles = []
+    for model_name in FAST_MODELS:
+        try:
+            res = client.models.generate_content(
+                model=model_name,
+                contents=weather_prompt,
+                config=types.GenerateContentConfig(system_instruction=BASE_SYSTEM_PROMPT)
+            )
+            if res.text:
+                weather_bubbles = [b.strip() for b in res.text.split("|||MSG|||") if b.strip()]
+                break
+        except Exception:
+            continue
+
+    if not weather_bubbles:
+        weather_bubbles = [
+            "มอร์นิ่งค่าา ตื่นรึยังเอ่ย ☀️ กัญญ์เอาสภาพอากาศและข่าวเชลซีเช้านี้มาเสิร์ฟแล้วค่ะ 😊",
+            f"วันนี้บริเวณ {loc_info['address']}\n🌡️ {loc_info['weather']}\n🌤️ {loc_info['daily_forecast']}"
+        ]
+
+    chelsea_bubbles = generate_chelsea_news_briefing()
+    return weather_bubbles + chelsea_bubbles
+
+def handle_user_location(user_id: int, lat: float, lon: float) -> str:
+    """บันทึกพิกัดผู้ใช้ วิเคราะห์สถานที่/สภาพอากาศ และให้กัญญ์วราตอบกลับแบบมนุษย์"""
+    loc_info = get_location_details(lat, lon)
+    user_locations[user_id] = loc_info
+
+    nearby_str = ", ".join(loc_info["nearby"]) if loc_info["nearby"] else "สามารถค้นหาเพิ่มเติมได้ใน Google Maps"
+    loc_summary = (
+        f"[ผู้ใช้เพิ่งแชร์ตำแหน่ง Location ปัจจุบันมาให้คุณ]\n"
+        f"- พิกัด: {lat}, {lon}\n"
+        f"- ที่อยู่: {loc_info['address']}\n"
+        f"- สภาพอากาศตรงจุดนั้นตอนนี้: {loc_info['weather']} ({loc_info['daily_forecast']})\n"
+        f"- สถานที่/ร้านค้าใกล้เคียง: {nearby_str}\n"
+        f"- ลิงก์แผนที่: {loc_info['maps_url']}\n\n"
+        f"ช่วยทักทายบอกผู้ใช้ว่าเห็นตำแหน่งแล้วว่าอยู่แถวไหน รายงานอากาศตรงนั้นให้ฟังแบบเป็นห่วงเป็นใย "
+        f"และบอกว่าทุกเช้ากัญญ์จะสรุปอากาศของพิกัดนี้พร้อมข่าวเชลซีส่งให้ด้วย (แบ่งตอบเป็น 2-3 กล่องข้อความคั่นด้วย |||MSG|||)"
+    )
+    return ask_agent(user_id, loc_summary)
 
 def search_live_web(query: str) -> str:
     """ค้นหาข่าวสารและข้อมูลล่าสุดจากอินเทอร์เน็ต (Google News & Web)"""
@@ -168,7 +409,7 @@ def get_system_prompt(user_id: int) -> str:
     now_str = now_th().strftime("%Y-%m-%d %H:%M:%S (เวลาประเทศไทย)")
     return f"{BASE_SYSTEM_PROMPT}\n(วันและเวลาปัจจุบัน: {now_str})" + get_user_memories_text(user_id)
 
-SEARCH_KEYWORDS = ("ข่าว", "ราคา", "ล่าสุด", "วันนี้", "ตอนนี้", "พยากรณ์อากาศ", "หุ้น", "ทอง", "บิตคอยน์", "ค้นหา", "เช็ค")
+SEARCH_KEYWORDS = ("ข่าว", "ราคา", "ล่าสุด", "วันนี้", "ตอนนี้", "พยากรณ์อากาศ", "หุ้น", "ทอง", "บิตคอยน์", "ค้นหา", "เช็ค", "ร้าน", "แถวนี้", "ใกล้", "เชลซี", "chelsea")
 
 def should_search_web(text: str) -> bool:
     return any(k in text.lower() for k in SEARCH_KEYWORDS)
@@ -207,11 +448,19 @@ def reset_chat(user_id: int):
         del chat_sessions[user_id]
 
 def ask_agent(user_id: int, message_text: str) -> str:
-    """ประมวลผลข้อความและตอบกลับแบบมนุษย์ (รองรับหลายกล่องข้อความคั่นด้วย |||MSG|||)"""
+    """ประมวลผลข้อความและตอบกลับแบบมนุษย์ (พร้อมแนบพิกัดล่าสุดหากเคยแชร์ไว้)"""
     chat, model_name = get_or_create_chat(user_id)
     now_str = now_th().strftime("%H:%M น.")
-    prompt_to_send = f"[เวลาไทยตอนนี้: {now_str}] {message_text}"
-    if should_search_web(message_text):
+    loc_context = ""
+    if user_id in user_locations and "[ผู้ใช้เพิ่งแชร์ตำแหน่ง" not in message_text:
+        loc = user_locations[user_id]
+        loc_context = f" [ตำแหน่งล่าสุดของผู้ใช้เมื่อ {loc['updated_at']}: {loc['address']} | อากาศ: {loc['weather']} | {loc.get('daily_forecast', '')}]"
+
+    prompt_to_send = f"[เวลาไทยตอนนี้: {now_str}]{loc_context} {message_text}"
+    if any(k in message_text.lower() for k in ("เชลซี", "chelsea")):
+        chelsea_raw = fetch_chelsea_news_all_sources()
+        prompt_to_send = f"{prompt_to_send}\n\n[ข่าวสโมสรเชลซีสดจาก 4 สำนักต่างประเทศ]:\n{chelsea_raw}"
+    elif should_search_web(message_text):
         web_context = search_live_web(message_text)
         prompt_to_send = f"{prompt_to_send}\n\n[ข้อมูลอ้างอิงสดจากอินเทอร์เน็ต]:\n{web_context}"
 

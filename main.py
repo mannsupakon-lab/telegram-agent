@@ -7,7 +7,7 @@ import logging
 import urllib.request
 import httpx
 from aiohttp import web
-from telegram import Update, Bot
+from telegram import Update, Bot, KeyboardButton, ReplyKeyboardMarkup
 from telegram.constants import ParseMode, ChatAction
 from telegram.request import HTTPXRequest
 from telegram.ext import (
@@ -42,14 +42,45 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# เวลาส่งสรุปสภาพอากาศ + ข่าวเชลซีประจำวันทุกเช้า (ค่าเริ่มต้น 07:30 น. เวลาไทย)
+MORNING_BRIEFING_HOUR = 7
+MORNING_BRIEFING_MINUTE = 30
+last_morning_sent_date = None
+
 def is_authorized(user_id: int) -> bool:
     """ตรวจสอบสิทธิ์การใช้งาน (Whitelist)"""
     if not ALLOWED_USER_ID:
         return True
     return str(user_id) == str(ALLOWED_USER_ID).strip()
 
-async def send_human_bubbles(update: Update, bubbles: list[str]):
+def get_location_keyboard() -> ReplyKeyboardMarkup:
+    """ปุ่มลัดกดส่งพิกัด GPS ในคลิกเดียว"""
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📍 ส่งตำแหน่งของฉันตอนนี้", request_location=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+async def send_bot_bubbles_to_chat(bot: Bot, chat_id: int, bubbles: list[str]):
+    """ส่งชุดข้อความหลายกล่องไปยัง chat_id โดยตรง พร้อมจังหวะกำลังพิมพ์แบบมนุษย์"""
+    for idx, msg in enumerate(bubbles):
+        if idx > 0:
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
+        try:
+            await bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await bot.send_message(chat_id=chat_id, text=msg)
+
+async def send_human_bubbles(update: Update, bubbles: list[str], reply_markup=None):
     """ส่งข้อความทีละกล่องแบบจังหวะมนุษย์พิมพ์แชทจริงๆ (Multi-Bubble + Typing Rhythm)"""
+    msg_target = update.message or update.edited_message
+    if not msg_target:
+        return
+
     clean_bubbles = [b.strip() for b in bubbles if b and b.strip()]
     if not clean_bubbles:
         clean_bubbles = ["กัญญ์อยู่นี่ค่าา มีอะไรให้ช่วยบอกได้เลยนะคะ 😊"]
@@ -57,42 +88,60 @@ async def send_human_bubbles(update: Update, bubbles: list[str]):
     for idx, bubble in enumerate(clean_bubbles):
         if idx > 0:
             try:
-                await update.message.reply_chat_action(ChatAction.TYPING)
+                await msg_target.reply_chat_action(ChatAction.TYPING)
             except Exception:
                 pass
-            # หน่วงเวลาสั้นๆ ให้เหมือนคนกำลังพิมพ์ข้อความถัดไป (0.6 - 1.2 วินาที)
             delay = min(1.2, max(0.5, len(bubble) * 0.015))
             await asyncio.sleep(delay)
+
+        is_last = idx == len(clean_bubbles) - 1
+        markup = reply_markup if is_last else None
 
         max_len = 4000
         for i in range(0, len(bubble), max_len):
             chunk = bubble[i : i + max_len]
             try:
-                await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+                await msg_target.reply_text(chunk, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
             except Exception:
-                await update.message.reply_text(chunk)
+                await msg_target.reply_text(chunk, reply_markup=markup)
 
-async def send_safe_reply(update: Update, text: str):
+async def send_safe_reply(update: Update, text: str, reply_markup=None):
     """แยกข้อความด้วย |||MSG||| แล้วส่งเป็นหลายบอลลูนแบบมนุษย์"""
     if not text:
         text = "กัญญ์อยู่นี่ค่าา มีอะไรให้ช่วยบอกได้เลยนะคะ 😊"
     bubbles = text.split("|||MSG|||")
-    await send_human_bubbles(update, bubbles)
+    await send_human_bubbles(update, bubbles, reply_markup=reply_markup)
 
 def schedule_reminder_task(bot: Bot, user_id: int, seconds: int, alert_bubbles: list[str]):
     """ตั้งเวลาส่งแจ้งเตือนจริงใน Background (ส่งเป็นชุดข้อความเหมือนคนทักมาปลุก/เตือนจริงๆ)"""
     async def delayed_send():
         await asyncio.sleep(seconds)
-        for idx, msg in enumerate(alert_bubbles):
-            if idx > 0:
-                try:
-                    await bot.send_chat_action(chat_id=user_id, action=ChatAction.TYPING)
-                except Exception:
-                    pass
-                await asyncio.sleep(0.7)
-            await bot.send_message(chat_id=user_id, text=msg)
+        await send_bot_bubbles_to_chat(bot, user_id, alert_bubbles)
 
     asyncio.create_task(delayed_send())
+
+async def daily_morning_weather_loop(bot: Bot):
+    """ลูปตรวจสอบเวลาไทยเพื่อส่งสรุปสภาพอากาศ + ข่าวเชลซีทุกเช้าเวลา 07:30 น."""
+    global last_morning_sent_date
+    while True:
+        try:
+            now = agent.now_th()
+            today_str = now.strftime("%Y-%m-%d")
+            if (
+                ALLOWED_USER_ID
+                and now.hour == MORNING_BRIEFING_HOUR
+                and now.minute >= MORNING_BRIEFING_MINUTE
+                and now.minute <= MORNING_BRIEFING_MINUTE + 5
+                and last_morning_sent_date != today_str
+            ):
+                last_morning_sent_date = today_str
+                uid = int(ALLOWED_USER_ID.strip())
+                logger.info(f"Sending daily morning weather + Chelsea briefing to {uid}...")
+                bubbles = await asyncio.to_thread(agent.generate_morning_weather_briefing, uid)
+                await send_bot_bubbles_to_chat(bot, uid, bubbles)
+        except Exception as e:
+            logger.error(f"Morning weather loop error: {e}")
+        await asyncio.sleep(30)
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """คำสั่งเริ่มต้น /start"""
@@ -105,15 +154,33 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"สวัสดีค่าาคุณ {user.first_name}! กัญญ์วรามาแล้วค่ะ 😊✨",
         (
             "กัญญ์เป็นเลขาส่วนตัวและเพื่อนคู่คิดของคุณนะคะ คุยกับกัญญ์ได้เหมือนคุยกับคนจริงๆ เลย!\n\n"
-            "• 💬 ชวนคุย ปรึกษา หรือให้ค้นหาข่าว/ราคาทอง/ข้อมูลสด\n"
+            "• ☀️🔵 **ทุกเช้า 07:30 น.** กัญญ์จะทักมาสรุป **สภาพอากาศ + ข่าวเชลซีจาก 4 สำนักดัง** ให้ฟังอัตโนมัติ\n"
+            "• 🦁 พิมพ์ `/chelsea` หรือ *'สรุปข่าวเชลซี'* เพื่อดูข่าวเชลซีล่าสุดตอนนี้ได้เลย\n"
+            "• 🌤️ พิมพ์ `/weather` หรือ *'สรุปอากาศ'* เพื่อดูสภาพอากาศตรงจุดที่คุณอยู่\n"
+            "• 📍 **กดปุ่ม 'ส่งตำแหน่งของฉันตอนนี้' ด้านล่าง** เพื่อให้กัญญ์จำพิกัดของคุณไว้เช็คอากาศและหาร้านอร่อยๆ\n"
             "• ⏰ สั่งตั้งเตือนด้วยภาษาพูดได้เลย เช่น *'12.00 เตือนไปกินข้าวหน่อย ทักมารัวๆ เลยนะ'*\n"
-            "• 📸 ส่งรูปสลิป เอกสาร หรืออาหารมาให้ช่วยดู\n"
-            "• 🎙️ อัดเสียงส่งมาคุยกันได้เลย\n"
-            "• 🎨 สั่ง *'วาดรูป...'* หรือ 📊 *'สร้างไฟล์ excel...'*\n"
-            "• 🧠 บอกว่า *'จำไว้ว่า...'* เพื่อให้กัญญ์จำเรื่องสำคัญของคุณไว้ถาวร"
+            "• 📸 ส่งรูปสลิป เอกสาร หรือ 🎙️ อัดเสียงส่งมาคุยกันได้เลยค่ะ!"
         ),
         "วันนี้มีอะไรให้กัญญ์ช่วยดูแล บอกมาได้เลยน้าา 💕"
     ]
+    await send_human_bubbles(update, bubbles, reply_markup=get_location_keyboard())
+
+async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """คำสั่งขอดูสรุปสภาพอากาศ + ข่าวเชลซีทันที /weather"""
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        return
+    asyncio.create_task(update.message.reply_chat_action(ChatAction.TYPING))
+    bubbles = await asyncio.to_thread(agent.generate_morning_weather_briefing, user_id)
+    await send_human_bubbles(update, bubbles)
+
+async def chelsea_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """คำสั่งขอดูสรุปข่าวเชลซีจาก 4 สำนักทันที /chelsea"""
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        return
+    asyncio.create_task(update.message.reply_chat_action(ChatAction.TYPING))
+    bubbles = await asyncio.to_thread(agent.generate_chelsea_news_briefing)
     await send_human_bubbles(update, bubbles)
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -243,6 +310,31 @@ async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("ระบุจำนวนนาทีเป็นตัวเลขนะคะ เช่น `/remind 15 ทานยา` ค่ะ 😊")
 
+async def handle_location_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """จัดการเมื่อผู้ใช้แชร์ Location หรือ Live Location เข้ามา"""
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        return
+
+    msg = update.message or update.edited_message
+    if not msg or not msg.location:
+        return
+
+    lat = msg.location.latitude
+    lon = msg.location.longitude
+
+    if update.message:
+        asyncio.create_task(msg.reply_chat_action(ChatAction.TYPING))
+        try:
+            reply = await asyncio.to_thread(agent.handle_user_location, user_id, lat, lon)
+            await send_safe_reply(update, reply)
+        except Exception as e:
+            logger.error(f"Location error: {e}")
+            await msg.reply_text(f"กัญญ์เห็นพิกัด ({lat:.4f}, {lon:.4f}) แล้วค่าา แต่ดึงข้อมูลแผนที่สะดุดนิดนึงค่ะ 🥺")
+    else:
+        loc_info = await asyncio.to_thread(agent.get_location_details, lat, lon)
+        agent.user_locations[user_id] = loc_info
+
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """จัดการข้อความแชททั่วไป"""
     user_id = update.effective_user.id
@@ -281,7 +373,23 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 ])
                 return
 
-    # 4. ตรวจจับคำสั่งตั้งเตือนความจำด้วยภาษาพูดธรรมชาติ (รองรับหลายเวลา + ทักเตือนหลายข้อความแบบคนจริงๆ)
+    # 4. ตรวจจับคำสั่งขอดูสรุปข่าวเชลซีทันที
+    if any(k in lower_text for k in ("สรุปข่าวเชลซี", "ข่าวเชลซีวันนี้", "อัพเดทข่าวเชลซี", "อัปเดตข่าวเชลซี")):
+        await chelsea_command(update, context)
+        return
+
+    # 5. ตรวจจับคำสั่งขอดูสรุปสภาพอากาศทันที
+    if any(k in lower_text for k in ("สรุปอากาศ", "สรุปสภาพอากาศ", "อากาศเช้านี้", "พยากรณ์อากาศวันนี้")):
+        await weather_command(update, context)
+        return
+
+    # 6. ถ้าผู้ใช้ถามเรื่องสถานที่/แถวนี้ แต่ยังไม่เคยแชร์ Location เลย ให้ส่งปุ่มกดแชร์ Location ให้ด้วย
+    need_loc_btn = (
+        user_id not in agent.user_locations
+        and any(k in lower_text for k in ("อยู่ที่ไหน", "แถวนี้", "ใกล้ฉัน", "โลเคชัน", "location", "พิกัด"))
+    )
+
+    # 7. ตรวจจับคำสั่งตั้งเตือนความจำด้วยภาษาพูดธรรมชาติ
     if any(k in lower_text for k in ("เตือน", "ปลุก", "ทักมาตอน", "ทักตอน")):
         asyncio.create_task(update.message.reply_chat_action(ChatAction.TYPING))
         rem_info = await asyncio.to_thread(agent.extract_reminder_intent, text)
@@ -304,11 +412,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await send_human_bubbles(update, confirm_bubbles)
             return
 
-    # 5. ตอบคำถามปกติแบบมนุษย์ (ส่งเป็นหลายกล่องข้อความ Multi-Bubble)
+    # 8. ตอบคำถามปกติแบบมนุษย์ (ส่งเป็นหลายกล่องข้อความ Multi-Bubble)
     asyncio.create_task(update.message.reply_chat_action(ChatAction.TYPING))
     try:
         reply = await asyncio.to_thread(agent.ask_agent, user_id, text)
-        await send_safe_reply(update, reply)
+        markup = get_location_keyboard() if need_loc_btn else None
+        await send_safe_reply(update, reply, reply_markup=markup)
     except Exception as e:
         logger.error(f"Error handling text: {e}")
         await update.message.reply_text("แงง เมื่อกี้สัญญาณสะดุดนิดนึงค่ะ พิมพ์บอกกัญญ์อีกทีได้ไหมคะ 🥺")
@@ -392,12 +501,15 @@ def build_telegram_app() -> Application:
     )
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("weather", weather_command))
+    app.add_handler(CommandHandler("chelsea", chelsea_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("memo", memo_command))
     app.add_handler(CommandHandler("draw", draw_command))
     app.add_handler(CommandHandler("excel", excel_command))
     app.add_handler(CommandHandler("remind", remind_command))
 
+    app.add_handler(MessageHandler(filters.LOCATION, handle_location_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_message))
@@ -408,6 +520,9 @@ async def run_cloud_run_server(tg_app: Application, port: int):
     """รันโหมด Webhook สำหรับ Render / Cloud Run (ออนไลน์ 24 ชม.)"""
     await tg_app.initialize()
     await tg_app.start()
+
+    # เริ่มต้นลูปส่งพยากรณ์อากาศ + ข่าวเชลซีทุกเช้า 07:30 น.
+    asyncio.create_task(daily_morning_weather_loop(tg_app.bot))
 
     external_url = os.getenv("RENDER_EXTERNAL_URL", "https://telegram-agent-wxg0.onrender.com").rstrip("/")
 
@@ -435,6 +550,7 @@ async def run_cloud_run_server(tg_app: Application, port: int):
             <div style="background: white; padding: 30px; border-radius: 12px; max-width: 600px; margin: auto; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
                 <h1 style="color: #2ecc71;">✅ กัญญ์วรา ออนไลน์ 24 ชั่วโมงแล้วค่ะ!</h1>
                 <p>เวลาประเทศไทยบนระบบ: <b>{agent.now_th().strftime('%Y-%m-%d %H:%M:%S')}</b></p>
+                <p>☀️🔵 ตั้งเวลาส่งสรุปสภาพอากาศ + ข่าวเชลซีทุกเช้าเวลา: <b>07:30 น.</b></p>
                 <code style="background: #eee; padding: 8px 12px; border-radius: 6px; display: inline-block;">{webhook_url}</code>
             </div>
         </body>
