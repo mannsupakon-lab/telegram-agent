@@ -4,9 +4,10 @@ import sys
 import socket
 import asyncio
 import logging
+import urllib.request
 import httpx
 from aiohttp import web
-from telegram import Update
+from telegram import Update, Bot
 from telegram.constants import ParseMode, ChatAction
 from telegram.request import HTTPXRequest
 from telegram.ext import (
@@ -59,6 +60,17 @@ async def send_safe_reply(update: Update, text: str):
         except Exception:
             await update.message.reply_text(chunk)
 
+def schedule_reminder_task(bot: Bot, user_id: int, seconds: int, reminder_text: str):
+    """ตั้งเวลาส่งแจ้งเตือนจริงใน Background"""
+    async def delayed_send():
+        await asyncio.sleep(seconds)
+        now_str = agent.now_th().strftime("%H:%M น.")
+        await bot.send_message(
+            chat_id=user_id,
+            text=f"⏰ แจ้งเตือนความจำ! ({now_str})\n\n📌 {reminder_text}"
+        )
+    asyncio.create_task(delayed_send())
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """คำสั่งเริ่มต้น /start"""
     user = update.effective_user
@@ -76,7 +88,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🎨 สั่งวาดรูป: `/draw <คำอธิบาย>` หรือพิมพ์ *'วาดรูป...'*\n"
         "• 📊 สร้างไฟล์ Excel: `/excel <หัวข้อ>` หรือพิมพ์ *'สร้างไฟล์ excel...'*\n"
         "• 🧠 สั่งจำข้อมูลถาวร: `/memo <ข้อมูลที่ต้องการให้จำ>`\n"
-        "• ⏰ ตั้งเตือนความจำ: `/remind <นาที> <ข้อความ>`\n"
+        "• ⏰ ตั้งเตือนความจำ: พิมพ์บอกเวลาได้เลย เช่น *'เตือนตอน 11.30 น. ประชุม'* หรือ `/remind <นาที> <ข้อความ>`\n"
         "• 🔄 เริ่มหัวข้อใหม่: `/reset`"
     )
     await send_safe_reply(update, welcome_text)
@@ -187,18 +199,13 @@ async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reminder_text = " ".join(context.args[1:])
         seconds = int(minutes * 60)
 
-        async def alarm(ctx: ContextTypes.DEFAULT_TYPE):
-            await ctx.bot.send_message(chat_id=user_id, text=f"⏰ แจ้งเตือนความจำ!\n\n📌 {reminder_text}")
-
-        if context.job_queue:
-            context.job_queue.run_once(alarm, seconds, chat_id=user_id, name=str(user_id))
-        else:
-            async def delayed_send():
-                await asyncio.sleep(seconds)
-                await context.bot.send_message(chat_id=user_id, text=f"⏰ แจ้งเตือนความจำ!\n\n📌 {reminder_text}")
-            asyncio.create_task(delayed_send())
-
-        await update.message.reply_text(f"✅ บันทึกแล้ว! ผมจะทักมาเตือนคุณเรื่อง: \"{reminder_text}\" ในอีก {minutes:g} นาทีข้างหน้าครับ")
+        schedule_reminder_task(context.bot, user_id, seconds, reminder_text)
+        target_dt = agent.now_th() + agent.timedelta(seconds=seconds)
+        await update.message.reply_text(
+            f"✅ ตั้งเวลาแจ้งเตือนจริงในระบบแล้วครับ!\n"
+            f"📌 เรื่อง: \"{reminder_text}\"\n"
+            f"🕒 เวลาที่จะเตือน: {target_dt.strftime('%H:%M น.')} (อีก {minutes:g} นาที)"
+        )
     except ValueError:
         await update.message.reply_text("⚠️ กรุณาระบุจำนวนนาทีเป็นตัวเลขครับ เช่น `/remind 15 ทานยา`")
 
@@ -237,7 +244,25 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text(f"🧠 จำไว้เรียบร้อยแล้วครับ:\n📌 \"{note}\"")
                 return
 
-    # 4. ตอบคำถามปกติด้วย Gemini + Search
+    # 4. ตรวจจับคำสั่งตั้งเตือนความจำด้วยภาษาพูดธรรมชาติ (เช่น "เตือนตอน 11.15 น.", "อีก 10 นาทีเตือน...")
+    if any(k in lower_text for k in ("เตือน", "ปลุก")):
+        asyncio.create_task(update.message.reply_chat_action(ChatAction.TYPING))
+        rem_info = await asyncio.to_thread(agent.extract_reminder_intent, text)
+        if rem_info and rem_info.get("is_reminder"):
+            seconds = int(rem_info["seconds_from_now"])
+            task_name = rem_info.get("task") or text
+            target_time_str = rem_info.get("target_time_str", "")
+            schedule_reminder_task(context.bot, user_id, seconds, task_name)
+            mins = round(seconds / 60, 1)
+            await update.message.reply_text(
+                f"⏰ ตั้งเวลาแจ้งเตือนในระบบเรียบร้อยแล้วครับ!\n"
+                f"📌 เรื่อง: \"{task_name}\"\n"
+                f"🕒 เวลาแจ้งเตือน: {target_time_str} (อีกประมาณ {mins:g} นาที)\n"
+                f"(เวลาไทยปัจจุบัน: {agent.now_th().strftime('%H:%M น.')})"
+            )
+            return
+
+    # 5. ตอบคำถามปกติด้วย Gemini + Search
     asyncio.create_task(update.message.reply_chat_action(ChatAction.TYPING))
     try:
         reply = await asyncio.to_thread(agent.ask_agent, user_id, text)
@@ -338,38 +363,52 @@ def build_telegram_app() -> Application:
     return app
 
 async def run_cloud_run_server(tg_app: Application, port: int):
-    """รันโหมด Webhook สำหรับ Google Cloud Run (ออนไลน์ 24 ชม.)"""
+    """รันโหมด Webhook สำหรับ Render / Cloud Run (ออนไลน์ 24 ชม.)"""
     await tg_app.initialize()
     await tg_app.start()
 
+    external_url = os.getenv("RENDER_EXTERNAL_URL", "https://telegram-agent-wxg0.onrender.com").rstrip("/")
+
+    # ตั้งค่า Webhook ตอนเริ่มเซิร์ฟเวอร์อัตโนมัติ
+    try:
+        await tg_app.bot.set_webhook(url=f"{external_url}/webhook", drop_pending_updates=True)
+        logger.info(f"Auto-registered webhook: {external_url}/webhook")
+    except Exception as e:
+        logger.warning(f"Initial webhook set warning: {e}")
+
     async def handle_index(request: web.Request) -> web.Response:
-        # เมื่อเปิดหน้าเว็บ Cloud Run ครั้งแรก จะผูก Webhook กับ Telegram ให้อัตโนมัติ!
         host = request.headers.get("X-Forwarded-Host") or request.host
-        webhook_url = f"https://{host}/webhook"
-        try:
-            await tg_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-            html = f"""
-            <html>
-            <head><meta charset="utf-8"><title>Telegram AI Agent Status</title></head>
-            <body style="font-family: sans-serif; padding: 40px; text-align: center; background: #f4f7f6;">
-                <div style="background: white; padding: 30px; border-radius: 12px; max-width: 600px; margin: auto; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
-                    <h1 style="color: #2ecc71;">✅ บอทออนไลน์ 24 ชั่วโมงบน Cloud Run แล้ว!</h1>
-                    <p>เชื่อมต่อ Telegram Webhook อัตโนมัติสำเร็จ:</p>
-                    <code style="background: #eee; padding: 8px 12px; border-radius: 6px; display: inline-block;">{webhook_url}</code>
-                    <p style="margin-top: 20px; color: #555;">คุณสามารถปิดหน้านี้ และปิดคอมพิวเตอร์ได้เลยครับ บอทพร้อมตอบกลับตลอดเวลา!</p>
-                </div>
-            </body>
-            </html>
-            """
-            return web.Response(text=html, content_type="text/html")
-        except Exception as e:
-            return web.Response(text=f"Running, but webhook setup error: {e}", status=500)
+        if "127.0.0.1" not in host and "localhost" not in host:
+            webhook_url = f"https://{host}/webhook"
+            try:
+                await tg_app.bot.set_webhook(url=webhook_url)
+            except Exception:
+                pass
+        else:
+            webhook_url = f"{external_url}/webhook"
+
+        html = f"""
+        <html>
+        <head><meta charset="utf-8"><title>Telegram AI Agent Status</title></head>
+        <body style="font-family: sans-serif; padding: 40px; text-align: center; background: #f4f7f6;">
+            <div style="background: white; padding: 30px; border-radius: 12px; max-width: 600px; margin: auto; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+                <h1 style="color: #2ecc71;">✅ บอทออนไลน์ 24 ชั่วโมงแล้ว!</h1>
+                <p>เวลาประเทศไทยบนระบบ: <b>{agent.now_th().strftime('%Y-%m-%d %H:%M:%S')}</b></p>
+                <code style="background: #eee; padding: 8px 12px; border-radius: 6px; display: inline-block;">{webhook_url}</code>
+            </div>
+        </body>
+        </html>
+        """
+        return web.Response(text=html, content_type="text/html")
+
+    async def handle_health(request: web.Request) -> web.Response:
+        return web.Response(text="ALIVE")
 
     async def handle_webhook(request: web.Request) -> web.Response:
         try:
             data = await request.json()
             update = Update.de_json(data, tg_app.bot)
-            await tg_app.process_update(update)
+            asyncio.create_task(tg_app.process_update(update))
             return web.Response(text="OK")
         except Exception as e:
             logger.error(f"Webhook processing error: {e}")
@@ -377,17 +416,25 @@ async def run_cloud_run_server(tg_app: Application, port: int):
 
     web_app = web.Application()
     web_app.router.add_get("/", handle_index)
+    web_app.router.add_get("/health", handle_health)
     web_app.router.add_post("/webhook", handle_webhook)
 
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
-    logger.info(f"Cloud Run Webhook server listening on port {port}...")
+    logger.info(f"Webhook server listening on port {port}...")
     await site.start()
 
-    # รันค้างไว้ใน Container
+    # ระบบ Self-Ping ทุก 10 นาที เพื่อป้องกันไม่ให้ Render Free Tier หลับขณะรอแจ้งเตือน
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(600)
+        try:
+            await asyncio.to_thread(
+                lambda: urllib.request.urlopen(f"{external_url}/health", timeout=10).read()
+            )
+            logger.info("Keep-alive ping sent.")
+        except Exception:
+            pass
 
 def main():
     missing = validate_config()
@@ -397,7 +444,6 @@ def main():
 
     tg_app = build_telegram_app()
 
-    # ถ้ารันบน Google Cloud Run (มีตัวแปร K_SERVICE หรือ PORT) ให้รันโหมด Webhook
     cloud_port = os.getenv("PORT")
     if os.getenv("K_SERVICE") or cloud_port:
         port = int(cloud_port or 8080)

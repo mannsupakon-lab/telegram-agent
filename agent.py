@@ -6,12 +6,18 @@ import socket
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import httpx
 import pandas as pd
 from PIL import Image
 from google import genai
 from google.genai import types
+
+# เวลาประเทศไทย (GMT+7) เสมอ แม้รันบน Cloud Server ที่เป็น UTC
+TH_TZ = timezone(timedelta(hours=7))
+
+def now_th() -> datetime:
+    return datetime.now(TH_TZ)
 
 # บังคับใช้ IPv4 เท่านั้น ป้องกันปัญหา IPv6 ค้าง (Blackhole) บนอินเทอร์เน็ตบ้าน
 _orig_getaddrinfo = socket.getaddrinfo
@@ -50,14 +56,14 @@ BASE_SYSTEM_PROMPT = """คุณคือ AI Personal Assistant (ชื่อ �
 บุคลิก: ฉลาด กระตือรือร้น สุภาพ จริงใจ และเป็นมิตร ใช้ภาษาไทยเป็นหลัก ตอบกระชับ ชัดเจน เข้าใจง่าย
 ความสามารถของคุณ:
 1. ตอบคำถาม วิเคราะห์ข้อมูล ให้คำปรึกษา สรุปสาระสำคัญ
-2. ค้นหาข้อมูลข่าวสารและข้อมูลปัจจุบัน (ใช้ฟังก์ชัน search_live_web เมื่อผู้ใช้ถามข่าว ราคา หรือเหตุการณ์ปัจจุบัน)
+2. ค้นหาข้อมูลข่าวสารและข้อมูลปัจจุบัน
 3. วิเคราะห์รูปภาพ สลิป เอกสาร เมนูอาหาร ป้ายข้อความ
 4. ถอดความและทำความเข้าใจไฟล์เสียง
 5. สร้างไฟล์ตาราง Excel และวาดรูปภาพตามคำสั่ง
 """
 
 def search_live_web(query: str) -> str:
-    """ค้นหาข่าวสารและข้อมูลล่าสุดจากอินเทอร์เน็ต (Google News & Web) เมื่อผู้ใช้ถามเรื่องปัจจุบัน ข่าว ราคา หรือเหตุการณ์ล่าสุด"""
+    """ค้นหาข่าวสารและข้อมูลล่าสุดจากอินเทอร์เน็ต (Google News & Web)"""
     try:
         encoded = urllib.parse.quote(query)
         url = f"https://news.google.com/rss/search?q={encoded}&hl=th&gl=TH&ceid=TH:th"
@@ -71,10 +77,46 @@ def search_live_web(query: str) -> str:
             pub_date = item.findtext("pubDate", "")
             items.append(f"- {title} ({pub_date})")
         if items:
-            return f"ผลการค้นหาล่าสุดสำหรับ '{query}' (วันที่ระบบ {datetime.now().strftime('%Y-%m-%d')}):\n" + "\n".join(items)
+            return f"ผลการค้นหาล่าสุดสำหรับ '{query}' (วันที่ระบบ {now_th().strftime('%Y-%m-%d %H:%M')}):\n" + "\n".join(items)
         return f"ไม่พบข่าวสารล่าสุดสำหรับ '{query}'"
     except Exception as e:
         return f"ไม่สามารถดึงข้อมูลค้นหาได้: {e}"
+
+def extract_reminder_intent(text: str) -> dict | None:
+    """ให้ AI ตรวจสอบว่าข้อความนี้เป็นการสั่งตั้งเวลาเตือนหรือไม่ และคำนวณเวลาเป็นวินาทีเทียบกับเวลาไทยปัจจุบัน"""
+    current_dt = now_th()
+    current_str = current_dt.strftime("%Y-%m-%d %H:%M:%S")
+    prompt = f"""เวลาประเทศไทยปัจจุบันคือ: {current_str}
+ข้อความจากผู้ใช้: "{text}"
+
+วิเคราะห์ว่าผู้ใช้กำลังสั่งให้ "ตั้งเวลาแจ้งเตือน/ปลุก" ในอนาคตหรือไม่:
+- ถ้าใช่ ให้คำนวณจำนวนวินาทีนับจากเวลาปัจจุบัน ({current_str}) ไปจนถึงเวลาที่ผู้ใช้ต้องการให้เตือน
+- ตอบกลับเป็น JSON เท่านั้นตามรูปแบบนี้:
+{{
+  "is_reminder": true หรือ false,
+  "seconds_from_now": จำนวนวินาที (ตัวเลขจำนวนเต็ม เช่น 300),
+  "target_time_str": "เวลาที่จะเตือน เช่น 11:15 น.",
+  "task": "สิ่งที่ต้องเตือนสั้นๆ เช่น ทานยา / ประชุม"
+}}
+"""
+    for model_name in FAST_MODELS:
+        try:
+            res = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                )
+            )
+            if res.text:
+                data = json.loads(res.text.strip())
+                if isinstance(data, dict) and data.get("is_reminder") and int(data.get("seconds_from_now", 0)) > 0:
+                    return data
+                return None
+        except Exception as e:
+            print(f"Reminder parse error on {model_name}: {e}")
+            continue
+    return None
 
 def load_memories() -> dict:
     if os.path.exists(MEMORY_FILE):
@@ -102,7 +144,7 @@ def get_user_memories_text(user_id: int) -> str:
     return f"\n\n[ข้อมูลส่วนตัว/บันทึกความจำของผู้ใช้ที่คุณต้องจำไว้เสมอ]:\n{notes_str}"
 
 def get_system_prompt(user_id: int) -> str:
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_str = now_th().strftime("%Y-%m-%d %H:%M:%S (เวลาประเทศไทย)")
     return f"{BASE_SYSTEM_PROMPT}\n(วันและเวลาปัจจุบัน: {now_str})" + get_user_memories_text(user_id)
 
 SEARCH_KEYWORDS = ("ข่าว", "ราคา", "ล่าสุด", "วันนี้", "ตอนนี้", "พยากรณ์อากาศ", "หุ้น", "ทอง", "บิตคอยน์", "ค้นหา", "เช็ค")
@@ -144,12 +186,13 @@ def reset_chat(user_id: int):
         del chat_sessions[user_id]
 
 def ask_agent(user_id: int, message_text: str) -> str:
-    """ประมวลผลข้อความและตอบกลับอย่างรวดเร็ว (Single Round-Trip)"""
+    """ประมวลผลข้อความและตอบกลับอย่างรวดเร็ว (Single Round-Trip พร้อมเวลาไทยปัจจุบัน)"""
     chat, model_name = get_or_create_chat(user_id)
-    prompt_to_send = message_text
+    now_str = now_th().strftime("%H:%M น.")
+    prompt_to_send = f"[เวลาไทยตอนนี้: {now_str}] {message_text}"
     if should_search_web(message_text):
         web_context = search_live_web(message_text)
-        prompt_to_send = f"{message_text}\n\n[ข้อมูลอ้างอิงสดจากอินเทอร์เน็ต]:\n{web_context}"
+        prompt_to_send = f"{prompt_to_send}\n\n[ข้อมูลอ้างอิงสดจากอินเทอร์เน็ต]:\n{web_context}"
 
     try:
         response = chat.send_message(prompt_to_send)
@@ -165,7 +208,7 @@ def ask_agent(user_id: int, message_text: str) -> str:
                     config=types.GenerateContentConfig(system_instruction=sys_prompt)
                 )
                 chat_sessions[user_id] = (fb_chat, fallback_model)
-                response = fb_chat.send_message(message_text)
+                response = fb_chat.send_message(prompt_to_send)
                 return response.text
             except Exception:
                 continue
