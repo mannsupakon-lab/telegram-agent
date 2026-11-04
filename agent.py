@@ -49,17 +49,21 @@ chat_sessions = {}
 # ไฟล์เก็บความจำถาวร (Persistent Memory)
 MEMORY_FILE = os.path.join(os.path.dirname(__file__), "user_memory.json")
 
-# โมเดลที่ตอบไวที่สุดบน Free Tier (0.5 วินาที)
+# โมเดลที่ตอบไวที่สุดบน Free Tier
 FAST_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
 
-BASE_SYSTEM_PROMPT = """คุณคือ AI Personal Assistant (ชื่อ กัญญ์วรา) ผู้ช่วยส่วนตัวอัจฉริยะ ทำหน้าที่ช่วยเหลือผู้ใช้ในทุกมิติ
-บุคลิก: ฉลาด กระตือรือร้น สุภาพ จริงใจ และเป็นมิตร ใช้ภาษาไทยเป็นหลัก ตอบกระชับ ชัดเจน เข้าใจง่าย
-ความสามารถของคุณ:
-1. ตอบคำถาม วิเคราะห์ข้อมูล ให้คำปรึกษา สรุปสาระสำคัญ
-2. ค้นหาข้อมูลข่าวสารและข้อมูลปัจจุบัน
-3. วิเคราะห์รูปภาพ สลิป เอกสาร เมนูอาหาร ป้ายข้อความ
-4. ถอดความและทำความเข้าใจไฟล์เสียง
-5. สร้างไฟล์ตาราง Excel และวาดรูปภาพตามคำสั่ง
+BASE_SYSTEM_PROMPT = """คุณคือ "กัญญ์วรา" (แทนตัวเองว่า กัญญ์ หรือ กัญญ์วรา หรือ เค้า ก็ได้ตามความเหมาะสม) เป็นเลขาส่วนตัวและเพื่อนคู่คิดที่มีชีวิตชีวา เหมือนมนุษย์จริงๆ 100%
+
+กฎเหล็กในการทำตัวให้เหมือนมนุษย์เวลาพิมพ์แชท:
+1. น้ำเสียงและอารมณ์: อบอุ่น เป็นกันเอง ขี้เล่นนิดๆ ใส่ใจความรู้สึก มีหางเสียงธรรมชาติ (เช่น ค่าา, นะคะ, น้า, เลยย, โอเคเลยค่ะ) และใช้อีโมจิประกอบอารมณ์แต่พอดี
+2. การส่งข้อความแบบคนแชทกัน (Multi-Bubble Chat):
+   - มนุษย์เวลาแชทจะไม่พิมพ์ก้อนใหญ่อัดกันยาวๆ ในข้อความเดียว
+   - ให้คุณแบ่งการตอบออกเป็น 2-3 กล่องข้อความสั้นๆ ที่เป็นจังหวะธรรมชาติ โดยคั่นแต่ละกล่องข้อความด้วยคำว่า |||MSG|||
+   - ตัวอย่าง:
+     ได้ยินแบบนั้นกัญญ์ก็ดีใจด้วยนะคะ 😊|||MSG|||วันนี้ทำงานเหนื่อยไหมคะ อย่าลืมหาอะไรอร่อยๆ ทานด้วยน้า|||MSG|||ถ้ามีอะไรให้ช่วยจัดการ บอกกัญญ์ได้ตลอดเลยค่ะ!
+   - หากผู้ใช้สั่งให้ส่งหลายข้อความ (เช่น "ทักมารัวๆ 4 ข้อความ") ให้คั่นด้วย |||MSG||| ตามจำนวนที่ผู้ใช้ต้องการ
+   - ยกเว้นกรณีผู้ใช้ขอเนื้อหายาวๆ เช่น บทความ โค้ด หรือตารางสรุปข้อมูล ให้ส่งรวมในกล่องข้อความนั้นให้อ่านง่าย
+3. ห้ามทำตัวเหมือนหุ่นยนต์: ห้ามพูดว่า "ในฐานะ AI" หรือตอบเป็นแพทเทิร์นแข็งๆ ให้คุยโต้ตอบเหมือนเพื่อนสนิทและเลขามืออาชีพที่มีหัวใจจริงๆ
 """
 
 def search_live_web(query: str) -> str:
@@ -83,20 +87,37 @@ def search_live_web(query: str) -> str:
         return f"ไม่สามารถดึงข้อมูลค้นหาได้: {e}"
 
 def extract_reminder_intent(text: str) -> dict | None:
-    """ให้ AI ตรวจสอบว่าข้อความนี้เป็นการสั่งตั้งเวลาเตือนหรือไม่ และคำนวณเวลาเป็นวินาทีเทียบกับเวลาไทยปัจจุบัน"""
+    """ให้ AI ตรวจสอบว่าข้อความนี้เป็นการสั่งตั้งเวลาเตือนหรือไม่ พร้อมสร้างข้อความเตือนแบบมนุษย์หลายข้อความ"""
     current_dt = now_th()
     current_str = current_dt.strftime("%Y-%m-%d %H:%M:%S")
     prompt = f"""เวลาประเทศไทยปัจจุบันคือ: {current_str}
 ข้อความจากผู้ใช้: "{text}"
 
-วิเคราะห์ว่าผู้ใช้กำลังสั่งให้ "ตั้งเวลาแจ้งเตือน/ปลุก" ในอนาคตหรือไม่:
-- ถ้าใช่ ให้คำนวณจำนวนวินาทีนับจากเวลาปัจจุบัน ({current_str}) ไปจนถึงเวลาที่ผู้ใช้ต้องการให้เตือน
-- ตอบกลับเป็น JSON เท่านั้นตามรูปแบบนี้:
+วิเคราะห์ว่าผู้ใช้กำลังสั่งให้ "ตั้งเวลาแจ้งเตือน/ปลุก/ทักมาบอก" ในอนาคตหรือไม่:
+- ถ้าไม่ใช่การสั่งตั้งเวลาในอนาคต ให้ตอบ {{"is_reminder": false}}
+- ถ้าใช่ ให้คำนวณจำนวนวินาทีนับจากเวลาปัจจุบัน ({current_str}) ไปจนถึงเวลาที่ต้องการให้เตือน (รองรับหลายรายการหากผู้ใช้สั่งหลายเวลา)
+- สร้างข้อความตอบรับตอนนี้ (confirm_bubbles) เป็นรายการข้อความแชทสั้นๆ 2 ข้อความแบบเลขาที่มีชีวิตชีวาและเป็นธรรมชาติ
+- สร้างข้อความที่จะทักไปเตือนเมื่อถึงเวลา (alert_bubbles) เป็นรายการข้อความแชท 2-3 ข้อความต่อเนื่องกันเหมือนคนทักมาปลุก/เตือนจริงๆ (หากผู้ใช้ขอให้ทักรัวๆ กี่ข้อความก็สร้างตามจำนวนนั้น)
+
+ตอบกลับเป็น JSON เท่านั้นตามรูปแบบนี้:
 {{
-  "is_reminder": true หรือ false,
-  "seconds_from_now": จำนวนวินาที (ตัวเลขจำนวนเต็ม เช่น 300),
-  "target_time_str": "เวลาที่จะเตือน เช่น 11:15 น.",
-  "task": "สิ่งที่ต้องเตือนสั้นๆ เช่น ทานยา / ประชุม"
+  "is_reminder": true,
+  "confirm_bubbles": [
+    "โอเคเลยค่าา เดี๋ยวพอถึงเวลา 11:50 น. กัญญ์รีบทักมาเตือนเลยนะคะ 😊",
+    "ไม่ต้องกลัวลืมเลย เดี๋ยวกัญญ์เฝ้าเวลาให้เองน้า!"
+  ],
+  "reminders": [
+    {{
+      "seconds_from_now": จำนวนวินาที (ตัวเลขจำนวนเต็ม เช่น 300),
+      "target_time_str": "11:50 น.",
+      "task": "สิ่งที่ต้องทำ",
+      "alert_bubbles": [
+        "ก๊อกๆๆ ตัวเองคะ 11:50 น. แล้วน้าา ⏰",
+        "ได้เวลาไปทำธุระเรื่อง ... ที่บอกกัญญ์ไว้แล้วนะคะ!",
+        "อย่าลืมน้าา สู้ๆ ค่าา ✌️😊"
+      ]
+    }}
+  ]
 }}
 """
     for model_name in FAST_MODELS:
@@ -110,7 +131,7 @@ def extract_reminder_intent(text: str) -> dict | None:
             )
             if res.text:
                 data = json.loads(res.text.strip())
-                if isinstance(data, dict) and data.get("is_reminder") and int(data.get("seconds_from_now", 0)) > 0:
+                if isinstance(data, dict) and data.get("is_reminder") and data.get("reminders"):
                     return data
                 return None
         except Exception as e:
@@ -141,7 +162,7 @@ def get_user_memories_text(user_id: int) -> str:
     if not memories:
         return ""
     notes_str = "\n".join(f"- {m}" for m in memories)
-    return f"\n\n[ข้อมูลส่วนตัว/บันทึกความจำของผู้ใช้ที่คุณต้องจำไว้เสมอ]:\n{notes_str}"
+    return f"\n\n[ข้อมูลส่วนตัว/เรื่องราวของผู้ใช้ที่คุณจำได้ขึ้นใจ]:\n{notes_str}"
 
 def get_system_prompt(user_id: int) -> str:
     now_str = now_th().strftime("%Y-%m-%d %H:%M:%S (เวลาประเทศไทย)")
@@ -153,7 +174,7 @@ def should_search_web(text: str) -> bool:
     return any(k in text.lower() for k in SEARCH_KEYWORDS)
 
 def get_or_create_chat(user_id: int):
-    """สร้างหรือดึงเซสชันการคุยเดิมของผู้ใช้ (ใช้โมเดลความเร็วสูง Single-Roundtrip)"""
+    """สร้างหรือดึงเซสชันการคุยเดิมของผู้ใช้"""
     if user_id in chat_sessions:
         return chat_sessions[user_id]
 
@@ -186,7 +207,7 @@ def reset_chat(user_id: int):
         del chat_sessions[user_id]
 
 def ask_agent(user_id: int, message_text: str) -> str:
-    """ประมวลผลข้อความและตอบกลับอย่างรวดเร็ว (Single Round-Trip พร้อมเวลาไทยปัจจุบัน)"""
+    """ประมวลผลข้อความและตอบกลับแบบมนุษย์ (รองรับหลายกล่องข้อความคั่นด้วย |||MSG|||)"""
     chat, model_name = get_or_create_chat(user_id)
     now_str = now_th().strftime("%H:%M น.")
     prompt_to_send = f"[เวลาไทยตอนนี้: {now_str}] {message_text}"
@@ -217,7 +238,7 @@ def ask_agent(user_id: int, message_text: str) -> str:
 def analyze_image(user_id: int, prompt: str, image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
     """วิเคราะห์รูปภาพผ่าน Gemini Multimodal"""
     part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
-    content_prompt = prompt if prompt else "ช่วยดูและวิเคราะห์รูปนี้อย่างละเอียดหน่อยครับ"
+    content_prompt = prompt if prompt else "ช่วยดูรูปนี้แล้วคุยตอบกลับแบบเป็นกันเองหน่อยค่ะ"
     sys_prompt = get_system_prompt(user_id)
 
     for model_name in FAST_MODELS:
@@ -244,7 +265,7 @@ def process_voice_audio(user_id: int, audio_bytes: bytes, mime_type: str = "audi
         try:
             response = client.models.generate_content(
                 model=model_name,
-                contents=["นี่คือข้อความเสียงจากผู้ใช้ ช่วยฟัง ถอดความ และตอบคำถามหรือให้คำปรึกษากลับมา:", part],
+                contents=["นี่คือเสียงพูดจากผู้ใช้ ช่วยฟังและพูดคุยตอบกลับอย่างเป็นธรรมชาติเหมือนเพื่อนและเลขาส่วนตัว:", part],
                 config=types.GenerateContentConfig(
                     system_instruction=sys_prompt
                 )
@@ -323,4 +344,4 @@ def generate_excel_bytes(topic_or_instruction: str) -> tuple[bytes, str]:
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Sheet1")
     output.seek(0)
-    return output.getvalue(), f"สร้างตารางทั้งหมด {len(df)} แถวเรียบร้อยครับ"
+    return output.getvalue(), f"กัญญ์ทำตารางให้ทั้งหมด {len(df)} แถวเรียบร้อยแล้วค่าา 📊✨"
