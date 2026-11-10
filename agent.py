@@ -6,7 +6,10 @@ import json
 import socket
 import urllib.parse
 import urllib.request
+import time
+import threading
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 import httpx
 import pandas as pd
@@ -141,19 +144,31 @@ def get_location_details(lat: float, lon: float) -> dict:
         "updated_at": now_th().strftime("%H:%M น.")
     }
 
-def fetch_chelsea_news_all_sources() -> str:
-    """ดึงข่าวสโมสรเชลซีล่าสุดจาก 4 แหล่ง: ChelseaFC.com, The Athletic, BBC Sport, Sky Sports / Sky News"""
-    sections = []
+def _fetch_google_news_rss(query: str, days: int, limit: int = 5) -> list[str]:
+    """ดึงหัวข้อข่าวจาก Google News RSS ตามคำค้น (ย้อนหลัง N วัน)"""
+    url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}+when:{days}d&hl=en-GB&gl=GB&ceid=GB:en"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    root = ET.fromstring(urllib.request.urlopen(req, timeout=7).read())
+    items = []
+    for item in root.findall(".//item")[:limit]:
+        title = item.findtext("title", "")
+        pub = item.findtext("pubDate", "")
+        items.append(f"- {title} ({pub})")
+    return items
 
-    # 1. ChelseaFC.com Official (หน้าเว็บโดยตรง + Google News indexing ของ chelseafc.com)
+def _fetch_chelsea_official() -> list[str]:
+    """1. ChelseaFC.com Official (หน้าเว็บโดยตรง + Google News indexing ของ chelseafc.com)"""
     chelsea_official = []
+    seen = set()
     try:
         req = urllib.request.Request("https://www.chelseafc.com/en", headers={"User-Agent": "Mozilla/5.0"})
         html = urllib.request.urlopen(req, timeout=7).read().decode("utf-8", errors="ignore")
         titles = re.findall(r'"title"\s*:\s*"([^"]{15,140})"', html)
-        seen = set()
+        keywords = ("palmer", "maresca", "blues", "match", "injury", "conference", "premier")
         for t in titles:
-            if t not in seen and "Chelsea" in t or any(w in t.lower() for w in ("palmer", "maresca", "blues", "match", "injury", "conference", "premier")):
+            if t in seen:
+                continue
+            if "Chelsea" in t or any(w in t.lower() for w in keywords):
                 seen.add(t)
                 chelsea_official.append(f"- {t}")
                 if len(chelsea_official) >= 4:
@@ -162,19 +177,13 @@ def fetch_chelsea_news_all_sources() -> str:
         pass
 
     try:
-        url = "https://news.google.com/rss/search?q=" + urllib.parse.quote("site:chelseafc.com") + "+when:3d&hl=en-GB&gl=GB&ceid=GB:en"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        root = ET.fromstring(urllib.request.urlopen(req, timeout=7).read())
-        for item in root.findall(".//item")[:5]:
-            title = item.findtext("title", "")
-            pub = item.findtext("pubDate", "")
-            chelsea_official.append(f"- {title} ({pub})")
+        chelsea_official.extend(_fetch_google_news_rss("site:chelseafc.com", days=3))
     except Exception:
         pass
-    if chelsea_official:
-        sections.append("1. [ChelseaFC.com (Official Site)]:\n" + "\n".join(chelsea_official[:5]))
+    return chelsea_official[:5]
 
-    # 2. BBC Sport Chelsea Official RSS
+def _fetch_chelsea_bbc() -> list[str]:
+    """2. BBC Sport Chelsea Official RSS"""
     bbc_items = []
     try:
         req = urllib.request.Request("https://feeds.bbci.co.uk/sport/football/teams/chelsea/rss.xml", headers={"User-Agent": "Mozilla/5.0"})
@@ -185,42 +194,56 @@ def fetch_chelsea_news_all_sources() -> str:
             bbc_items.append(f"- {title}: {desc}")
     except Exception:
         pass
-    if bbc_items:
-        sections.append("2. [BBC Sport - Chelsea]:\n" + "\n".join(bbc_items))
+    return bbc_items
 
-    # 3. The Athletic (nytimes.com/athletic & theathletic.com)
-    athletic_items = []
+def _fetch_chelsea_athletic() -> list[str]:
+    """3. The Athletic (nytimes.com/athletic & theathletic.com)"""
     try:
-        q = 'Chelsea FC (site:nytimes.com/athletic OR site:theathletic.com)'
-        url = f"https://news.google.com/rss/search?q={urllib.parse.quote(q)}+when:4d&hl=en-GB&gl=GB&ceid=GB:en"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        root = ET.fromstring(urllib.request.urlopen(req, timeout=7).read())
-        for item in root.findall(".//item")[:5]:
-            title = item.findtext("title", "")
-            pub = item.findtext("pubDate", "")
-            athletic_items.append(f"- {title} ({pub})")
+        return _fetch_google_news_rss('Chelsea FC (site:nytimes.com/athletic OR site:theathletic.com)', days=4)
     except Exception:
-        pass
-    if athletic_items:
-        sections.append("3. [The Athletic - Chelsea]:\n" + "\n".join(athletic_items))
+        return []
 
-    # 4. Sky Sports & Sky News
-    sky_items = []
+def _fetch_chelsea_sky() -> list[str]:
+    """4. Sky Sports & Sky News"""
     try:
-        q = 'Chelsea FC (site:skysports.com OR site:news.sky.com)'
-        url = f"https://news.google.com/rss/search?q={urllib.parse.quote(q)}+when:4d&hl=en-GB&gl=GB&ceid=GB:en"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        root = ET.fromstring(urllib.request.urlopen(req, timeout=7).read())
-        for item in root.findall(".//item")[:5]:
-            title = item.findtext("title", "")
-            pub = item.findtext("pubDate", "")
-            sky_items.append(f"- {title} ({pub})")
+        return _fetch_google_news_rss('Chelsea FC (site:skysports.com OR site:news.sky.com)', days=4)
     except Exception:
-        pass
-    if sky_items:
-        sections.append("4. [Sky Sports / Sky News - Chelsea]:\n" + "\n".join(sky_items))
+        return []
 
-    return "\n\n".join(sections) if sections else "ไม่พบข้อมูลข่าวเชลซีในขณะนี้"
+# Cache ข่าวเชลซี 30 นาที เพื่อไม่ต้องดึงใหม่ทุกครั้งที่พิมพ์คำว่า "เชลซี"
+CHELSEA_CACHE_SECONDS = 30 * 60
+_chelsea_cache = {"text": None, "at": 0.0}
+_chelsea_cache_lock = threading.Lock()
+
+def fetch_chelsea_news_all_sources() -> str:
+    """ดึงข่าวสโมสรเชลซีล่าสุดจาก 4 แหล่งพร้อมกัน (Parallel): ChelseaFC.com, BBC Sport, The Athletic, Sky Sports / Sky News"""
+    with _chelsea_cache_lock:
+        if _chelsea_cache["text"] and time.time() - _chelsea_cache["at"] < CHELSEA_CACHE_SECONDS:
+            return _chelsea_cache["text"]
+
+        sources = [
+            ("1. [ChelseaFC.com (Official Site)]", _fetch_chelsea_official),
+            ("2. [BBC Sport - Chelsea]", _fetch_chelsea_bbc),
+            ("3. [The Athletic - Chelsea]", _fetch_chelsea_athletic),
+            ("4. [Sky Sports / Sky News - Chelsea]", _fetch_chelsea_sky),
+        ]
+        with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+            futures = [pool.submit(fn) for _, fn in sources]
+            results = []
+            for f in futures:
+                try:
+                    results.append(f.result(timeout=20))
+                except Exception:
+                    results.append([])
+
+        sections = [f"{label}:\n" + "\n".join(items) for (label, _), items in zip(sources, results) if items]
+        if not sections:
+            return "ไม่พบข้อมูลข่าวเชลซีในขณะนี้"
+
+        text = "\n\n".join(sections)
+        _chelsea_cache["text"] = text
+        _chelsea_cache["at"] = time.time()
+        return text
 
 def generate_chelsea_news_briefing() -> list[str]:
     """ให้กัญญ์วราแปลและสรุปข่าวเชลซีจากทั้ง 4 สำนักเป็นภาษาไทยแบบเข้าใจง่าย"""
@@ -246,8 +269,8 @@ def generate_chelsea_news_briefing() -> list[str]:
 
     return [f"🔵🦁 สรุปข่าวเชลซีล่าสุดค่ะ:\n\n{raw_news[:1500]}"]
 
-def generate_morning_weather_briefing(user_id: int) -> list[str]:
-    """สร้างข้อความทักทายยามเช้า + สรุปสภาพอากาศ + สรุปข่าวเชลซีจาก 4 สำนัก (ส่งเป็นรายการ Bubbles)"""
+def generate_morning_weather_briefing(user_id: int, include_chelsea: bool = True) -> list[str]:
+    """สร้างข้อความทักทายยามเช้า + สรุปสภาพอากาศ (+ สรุปข่าวเชลซีจาก 4 สำนัก ถ้า include_chelsea=True)"""
     if user_id in user_locations:
         lat = user_locations[user_id]["lat"]
         lon = user_locations[user_id]["lon"]
@@ -286,6 +309,8 @@ def generate_morning_weather_briefing(user_id: int) -> list[str]:
             f"วันนี้บริเวณ {loc_info['address']}\n🌡️ {loc_info['weather']}\n🌤️ {loc_info['daily_forecast']}"
         ]
 
+    if not include_chelsea:
+        return weather_bubbles
     chelsea_bubbles = generate_chelsea_news_briefing()
     return weather_bubbles + chelsea_bubbles
 
@@ -447,6 +472,31 @@ def reset_chat(user_id: int):
     if user_id in chat_sessions:
         del chat_sessions[user_id]
 
+# จำกัดประวัติแชทไม่ให้ยาวเกินไป (ประหยัด Token / ลดโอกาสชน Quota 429 บน Free Tier)
+MAX_HISTORY_MESSAGES = 40   # เมื่อประวัติยาวเกินนี้ จะตัดเหลือ...
+KEEP_HISTORY_MESSAGES = 20  # ...ข้อความล่าสุดจำนวนนี้
+
+def _trim_chat_history(user_id: int):
+    """ตัดประวัติการสนทนาให้เหลือเฉพาะช่วงล่าสุด โดยเริ่มต้นด้วยข้อความของผู้ใช้เสมอ"""
+    if user_id not in chat_sessions:
+        return
+    chat, model_name = chat_sessions[user_id]
+    try:
+        history = chat.get_history()
+        if len(history) <= MAX_HISTORY_MESSAGES:
+            return
+        recent = history[-KEEP_HISTORY_MESSAGES:]
+        while recent and recent[0].role != "user":
+            recent = recent[1:]
+        new_chat = client.chats.create(
+            model=model_name,
+            config=types.GenerateContentConfig(system_instruction=get_system_prompt(user_id)),
+            history=recent,
+        )
+        chat_sessions[user_id] = (new_chat, model_name)
+    except Exception as e:
+        print(f"Trim history warning: {e}")
+
 def ask_agent(user_id: int, message_text: str) -> str:
     """ประมวลผลข้อความและตอบกลับแบบมนุษย์ (พร้อมแนบพิกัดล่าสุดหากเคยแชร์ไว้)"""
     chat, model_name = get_or_create_chat(user_id)
@@ -466,19 +516,27 @@ def ask_agent(user_id: int, message_text: str) -> str:
 
     try:
         response = chat.send_message(prompt_to_send)
+        _trim_chat_history(user_id)
         return response.text
     except Exception as e:
         print(f"Error with {model_name}, trying fallback: {e}")
-        reset_chat(user_id)
+        # เก็บประวัติเดิมไว้ เพื่อให้โมเดลสำรองคุยต่อได้โดยไม่ลืมบทสนทนา
+        try:
+            prev_history = list(chat.get_history())
+        except Exception:
+            prev_history = []
         sys_prompt = get_system_prompt(user_id)
-        for fallback_model in ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]:
+        fallback_order = [model_name] + [m for m in FAST_MODELS if m != model_name]
+        for fallback_model in fallback_order:
             try:
                 fb_chat = client.chats.create(
                     model=fallback_model,
-                    config=types.GenerateContentConfig(system_instruction=sys_prompt)
+                    config=types.GenerateContentConfig(system_instruction=sys_prompt),
+                    history=prev_history,
                 )
-                chat_sessions[user_id] = (fb_chat, fallback_model)
                 response = fb_chat.send_message(prompt_to_send)
+                chat_sessions[user_id] = (fb_chat, fallback_model)
+                _trim_chat_history(user_id)
                 return response.text
             except Exception:
                 continue

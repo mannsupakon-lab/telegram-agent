@@ -1,8 +1,12 @@
 import io
 import os
+import re
 import sys
+import html
+import hmac
 import socket
 import asyncio
+import hashlib
 import logging
 import urllib.request
 import httpx
@@ -42,16 +46,102 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ซ่อน Log ของ httpx ระดับ INFO เพราะ URL ที่ log ออกมามี Bot Token ติดไปด้วย
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# รหัสลับยืนยันว่า Request ที่เข้ามาทาง /webhook มาจาก Telegram จริง
+# (ตั้งเองได้ผ่าน env WEBHOOK_SECRET หากไม่ตั้งจะสร้างจาก Bot Token อัตโนมัติ)
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET") or hashlib.sha256(
+    f"webhook:{TELEGRAM_BOT_TOKEN}".encode("utf-8")
+).hexdigest()[:48]
+
+# เก็บ reference ของ Task เบื้องหลัง ป้องกันไม่ให้ถูก Garbage Collect ทิ้งกลางทาง
+_background_tasks: set[asyncio.Task] = set()
+
+def run_background(coro) -> asyncio.Task:
+    """สร้าง Task เบื้องหลังที่ปลอดภัย (ถือ reference ไว้จนกว่าจะทำงานเสร็จ)"""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 # เวลาส่งสรุปสภาพอากาศ + ข่าวเชลซีประจำวันทุกเช้า (ค่าเริ่มต้น 07:30 น. เวลาไทย)
 MORNING_BRIEFING_HOUR = 7
 MORNING_BRIEFING_MINUTE = 30
 last_morning_sent_date = None
 
 def is_authorized(user_id: int) -> bool:
-    """ตรวจสอบสิทธิ์การใช้งาน (Whitelist)"""
-    if not ALLOWED_USER_ID:
-        return True
+    """ตรวจสอบสิทธิ์การใช้งาน (Whitelist) - ถ้าไม่ได้ตั้ง ALLOWED_USER_ID จะปฏิเสธทุกคน (Fail-closed)"""
+    if not ALLOWED_USER_ID or not ALLOWED_USER_ID.strip():
+        logger.warning("ALLOWED_USER_ID is not set - rejecting all users for safety.")
+        return False
     return str(user_id) == str(ALLOWED_USER_ID).strip()
+
+def md_to_html(text: str) -> str:
+    """แปลง Markdown ที่ Gemini ตอบมา (**ตัวหนา**, *เอียง*, `code`, ### หัวข้อ, [ลิงก์](url)) เป็น HTML ที่ Telegram รองรับ"""
+    placeholders = []
+
+    def _stash(value: str) -> str:
+        placeholders.append(value)
+        return f"\x00{len(placeholders) - 1}\x00"
+
+    # 1. เก็บ code block / inline code ไว้ก่อน (ไม่แปลงอะไรข้างใน)
+    text = re.sub(r"```(?:\w+)?\n?(.*?)```", lambda m: _stash(f"<pre>{html.escape(m.group(1).strip())}</pre>"), text, flags=re.S)
+    text = re.sub(r"`([^`\n]+)`", lambda m: _stash(f"<code>{html.escape(m.group(1))}</code>"), text)
+
+    # 2. Escape อักขระพิเศษของ HTML
+    text = html.escape(text, quote=False)
+
+    # 3. ลิงก์ [ข้อความ](url)
+    text = re.sub(
+        r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)",
+        lambda m: _stash(f'<a href="{m.group(2).replace(chr(34), "&quot;")}">{m.group(1)}</a>'),
+        text,
+    )
+
+    # 4. หัวข้อ ### xxx -> ตัวหนา
+    text = re.sub(r"^\s{0,3}#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.M)
+
+    # 5. bullet "* " / "- " ต้นบรรทัด -> "• "
+    text = re.sub(r"^(\s*)[*\-]\s+", r"\1• ", text, flags=re.M)
+
+    # 6. ตัวหนา / ขีดเส้นใต้ / ตัวเอียง
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.S)
+    text = re.sub(r"__(.+?)__", r"<u>\1</u>", text, flags=re.S)
+    text = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", text)
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text, flags=re.S)
+
+    # 7. คืนค่า code / ลิงก์ที่เก็บไว้
+    return re.sub(r"\x00(\d+)\x00", lambda m: placeholders[int(m.group(1))], text)
+
+def strip_markdown(text: str) -> str:
+    """ลบสัญลักษณ์ Markdown ออก ใช้เป็น fallback ตอนส่ง HTML ไม่ผ่าน"""
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.S)
+    text = re.sub(r"^\s{0,3}#{1,6}\s+", "", text, flags=re.M)
+    text = text.replace("```", "").replace("`", "")
+    return text
+
+def split_message(text: str, max_len: int = 3500) -> list[str]:
+    """แบ่งข้อความยาวเป็นหลายท่อนตามบรรทัด (Telegram จำกัด 4096 ตัวอักษร)"""
+    if len(text) <= max_len:
+        return [text]
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        while len(line) > max_len:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:max_len])
+            line = line[max_len:]
+        if len(current) + len(line) + 1 > max_len:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+    return chunks
 
 def get_location_keyboard() -> ReplyKeyboardMarkup:
     """ปุ่มลัดกดส่งพิกัด GPS ในคลิกเดียว"""
@@ -71,9 +161,9 @@ async def send_bot_bubbles_to_chat(bot: Bot, chat_id: int, bubbles: list[str]):
                 pass
             await asyncio.sleep(0.8)
         try:
-            await bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN)
+            await bot.send_message(chat_id=chat_id, text=md_to_html(msg), parse_mode=ParseMode.HTML)
         except Exception:
-            await bot.send_message(chat_id=chat_id, text=msg)
+            await bot.send_message(chat_id=chat_id, text=strip_markdown(msg))
 
 async def send_human_bubbles(update: Update, bubbles: list[str], reply_markup=None):
     """ส่งข้อความทีละกล่องแบบจังหวะมนุษย์พิมพ์แชทจริงๆ (Multi-Bubble + Typing Rhythm)"""
@@ -97,13 +187,13 @@ async def send_human_bubbles(update: Update, bubbles: list[str], reply_markup=No
         is_last = idx == len(clean_bubbles) - 1
         markup = reply_markup if is_last else None
 
-        max_len = 4000
-        for i in range(0, len(bubble), max_len):
-            chunk = bubble[i : i + max_len]
+        chunks = split_message(bubble)
+        for c_idx, chunk in enumerate(chunks):
+            chunk_markup = markup if c_idx == len(chunks) - 1 else None
             try:
-                await msg_target.reply_text(chunk, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+                await msg_target.reply_text(md_to_html(chunk), parse_mode=ParseMode.HTML, reply_markup=chunk_markup)
             except Exception:
-                await msg_target.reply_text(chunk, reply_markup=markup)
+                await msg_target.reply_text(strip_markdown(chunk), reply_markup=chunk_markup)
 
 async def send_safe_reply(update: Update, text: str, reply_markup=None):
     """แยกข้อความด้วย |||MSG||| แล้วส่งเป็นหลายบอลลูนแบบมนุษย์"""
@@ -118,7 +208,7 @@ def schedule_reminder_task(bot: Bot, user_id: int, seconds: int, alert_bubbles: 
         await asyncio.sleep(seconds)
         await send_bot_bubbles_to_chat(bot, user_id, alert_bubbles)
 
-    asyncio.create_task(delayed_send())
+    run_background(delayed_send())
 
 async def daily_morning_weather_loop(bot: Bot):
     """ลูปตรวจสอบเวลาไทยเพื่อส่งสรุปสภาพอากาศ + ข่าวเชลซีทุกเช้าเวลา 07:30 น."""
@@ -166,12 +256,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_human_bubbles(update, bubbles, reply_markup=get_location_keyboard())
 
 async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """คำสั่งขอดูสรุปสภาพอากาศ + ข่าวเชลซีทันที /weather"""
+    """คำสั่งขอดูสรุปสภาพอากาศทันที /weather (ไม่รวมข่าวเชลซี เพื่อให้ตอบไว)"""
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         return
     asyncio.create_task(update.message.reply_chat_action(ChatAction.TYPING))
-    bubbles = await asyncio.to_thread(agent.generate_morning_weather_briefing, user_id)
+    bubbles = await asyncio.to_thread(agent.generate_morning_weather_briefing, user_id, False)
     await send_human_bubbles(update, bubbles)
 
 async def chelsea_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -459,11 +549,12 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     try:
         voice = update.message.voice or update.message.audio
+        mime_type = getattr(voice, "mime_type", None) or "audio/ogg"
         voice_file = await voice.get_file()
         voice_bytes = await voice_file.download_as_bytearray()
 
         reply = await asyncio.to_thread(
-            agent.process_voice_audio, user_id, bytes(voice_bytes), "audio/ogg"
+            agent.process_voice_audio, user_id, bytes(voice_bytes), mime_type
         )
         try:
             await status_msg.delete()
@@ -522,28 +613,20 @@ async def run_cloud_run_server(tg_app: Application, port: int):
     await tg_app.start()
 
     # เริ่มต้นลูปส่งพยากรณ์อากาศ + ข่าวเชลซีทุกเช้า 07:30 น.
-    asyncio.create_task(daily_morning_weather_loop(tg_app.bot))
+    run_background(daily_morning_weather_loop(tg_app.bot))
 
     external_url = os.getenv("RENDER_EXTERNAL_URL", "https://telegram-agent-wxg0.onrender.com").rstrip("/")
+    webhook_url = f"{external_url}/webhook"
 
     try:
-        await tg_app.bot.set_webhook(url=f"{external_url}/webhook", drop_pending_updates=True)
-        logger.info(f"Auto-registered webhook: {external_url}/webhook")
+        await tg_app.bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
+        logger.info(f"Auto-registered webhook (with secret token): {webhook_url}")
     except Exception as e:
         logger.warning(f"Initial webhook set warning: {e}")
 
     async def handle_index(request: web.Request) -> web.Response:
-        host = request.headers.get("X-Forwarded-Host") or request.host
-        if "127.0.0.1" not in host and "localhost" not in host:
-            webhook_url = f"https://{host}/webhook"
-            try:
-                await tg_app.bot.set_webhook(url=webhook_url)
-            except Exception:
-                pass
-        else:
-            webhook_url = f"{external_url}/webhook"
-
-        html = f"""
+        # หมายเหตุ: ห้ามตั้ง webhook จาก Host header ของผู้เยี่ยมชม (เสี่ยงถูกดึง webhook ไปเซิร์ฟเวอร์อื่น)
+        page = f"""
         <html>
         <head><meta charset="utf-8"><title>Telegram AI Agent Status</title></head>
         <body style="font-family: sans-serif; padding: 40px; text-align: center; background: #f4f7f6;">
@@ -551,21 +634,25 @@ async def run_cloud_run_server(tg_app: Application, port: int):
                 <h1 style="color: #2ecc71;">✅ กัญญ์วรา ออนไลน์ 24 ชั่วโมงแล้วค่ะ!</h1>
                 <p>เวลาประเทศไทยบนระบบ: <b>{agent.now_th().strftime('%Y-%m-%d %H:%M:%S')}</b></p>
                 <p>☀️🔵 ตั้งเวลาส่งสรุปสภาพอากาศ + ข่าวเชลซีทุกเช้าเวลา: <b>07:30 น.</b></p>
-                <code style="background: #eee; padding: 8px 12px; border-radius: 6px; display: inline-block;">{webhook_url}</code>
             </div>
         </body>
         </html>
         """
-        return web.Response(text=html, content_type="text/html")
+        return web.Response(text=page, content_type="text/html")
 
     async def handle_health(request: web.Request) -> web.Response:
         return web.Response(text="ALIVE")
 
     async def handle_webhook(request: web.Request) -> web.Response:
+        # ตรวจรหัสลับว่าเป็น Request จาก Telegram จริงเท่านั้น
+        received = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(received, WEBHOOK_SECRET):
+            logger.warning(f"Rejected webhook request with invalid secret from {request.remote}")
+            return web.Response(text="Forbidden", status=403)
         try:
             data = await request.json()
             update = Update.de_json(data, tg_app.bot)
-            asyncio.create_task(tg_app.process_update(update))
+            run_background(tg_app.process_update(update))
             return web.Response(text="OK")
         except Exception as e:
             logger.error(f"Webhook processing error: {e}")
