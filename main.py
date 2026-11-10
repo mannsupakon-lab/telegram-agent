@@ -609,7 +609,17 @@ def build_telegram_app() -> Application:
 
 async def run_cloud_run_server(tg_app: Application, port: int):
     """รันโหมด Webhook สำหรับ Render / Cloud Run (ออนไลน์ 24 ชม.)"""
-    await tg_app.initialize()
+    # ตอนเครื่อง Render เพิ่งบูต เครือข่ายอาจยังไม่พร้อม -> ลองเชื่อมต่อ Telegram ซ้ำแทนการล่มทันที
+    for attempt in range(1, 6):
+        try:
+            await tg_app.initialize()
+            break
+        except Exception as e:
+            if attempt == 5:
+                raise
+            wait = attempt * 3
+            logger.warning(f"Telegram initialize failed ({e!r}), retrying in {wait}s... [{attempt}/5]")
+            await asyncio.sleep(wait)
     await tg_app.start()
 
     # เริ่มต้นลูปส่งพยากรณ์อากาศ + ข่าวเชลซีทุกเช้า 07:30 น.
