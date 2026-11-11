@@ -23,6 +23,7 @@ from google.genai import types
 import agent
 
 GOOGLE_SHEET_ID = "1YOsuTlk48K0Sz7M4bWbqsYSH5lc6THE5qXTwd4faZ7s"
+STOCK_SHEET_ID = "1coWEi-XkpOvj4Rqg88CA1PY6v5d53lA8rJH07rAXjvw"
 DASHBOARD_URL = "https://sales-dashboard-40q.pages.dev/"
 CACHE_SECONDS = 10 * 60  # โหลดข้อมูลชีทใหม่ทุก 10 นาที
 
@@ -31,9 +32,10 @@ SALES_KEYWORDS = (
     "ลูกค้า", "สินค้า", "incentive", "อินเซนทีฟ", "อินเซน", "เป้า", "achievement", "cycle",
     "dashboard", "แดชบอร์ด", "sales", "กำไร", "profit", "คืนสินค้า", "ใบลดหนี้",
     "สั่ง", "ซื้อ", "แถม", "นพ.", "พญ.", "ภก.", "หมอ", "คลินิก", "คลีนิค", "รพ.", "โรงพยาบาล",
-    "ร้านยา", "เภสัช", "หจก", "บริษัท", "สต็อก", "stock", "ดีล", "โน้ต",
-    "meithromax", "esloray", "reminisin", "meigabalin", "meicoxia", "meipixa", "meipazin",
-    "diclex", "meixil", "gastach", "ampicaban",
+    "ร้านยา", "เภสัช", "หจก", "บริษัท", "สต็อก", "stock", "ดีล", "โน้ต", "ราคา", "โปร",
+    "exp", "หมดอายุ", "ล็อต", "batch", "lot", "ยา", "mg", "ตารางเวร", "งาน", "task",
+    "meithromax", "esloray", "reminisin", "reinisin", "meigabalin", "meicoxia", "meipixa", "meipazin",
+    "diclex", "meixil", "gastach", "ampicaban", "proctase", "acofide", "cefazolin", "meiphox",
 )
 
 # ---------------------------------------------------------------------------
@@ -151,6 +153,116 @@ def _prepare_notes(raw: bytes) -> pd.DataFrame:
     df["note"] = df["note"].str.replace("\\n", "\n", regex=False)
     return df
 
+def _download_url(url: str, timeout: int = 25) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+def _prepare_stock(raw: bytes) -> pd.DataFrame:
+    """แปลงชีทสต็อกคลังและวันหมดอายุ (Stock & Expiry Date) จาก StockView"""
+    if not raw.strip():
+        return pd.DataFrame()
+    df = pd.read_csv(io.BytesIO(raw), dtype=str)
+    out = pd.DataFrame({
+        "snapshot_date": df.get("Snapshot Date (End of)"),
+        "location_code": df.get("Storage Location Code"),
+        "location_desc": df.get("Storage Location Desc"),
+        "product_group": df.get("Product Group"),
+        "material_code": df.get("Material Code"),
+        "product_name": df.get("Material Desc", pd.Series(dtype=str)).str.strip(),
+        "batch_no": df.get("Batch No", pd.Series(dtype=str)).str.strip(),
+        "expiry_str": df.get("Expiry Date", pd.Series(dtype=str)).str.strip(),
+        "expiry_date": pd.to_datetime(df.get("Expiry Date"), errors="coerce"),
+        "stock_on_hand": _num(df.get("Stock on Hand", pd.Series(dtype=str))),
+        "stock_available": _num(df.get("Stock Available", pd.Series(dtype=str))),
+    })
+    return out[out["product_name"].notna() & (out["product_name"] != "")].reset_index(drop=True)
+
+def _prepare_prices(raw: bytes) -> pd.DataFrame:
+    """แปลงข้อมูล Price List & Promotion Deals จาก /api/price-list"""
+    if not raw.strip():
+        return pd.DataFrame()
+    obj = json.loads(raw.decode("utf-8", errors="ignore"))
+    rows = obj.get("data", []) if isinstance(obj, dict) else obj
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+def _prepare_doctors(raw: bytes) -> pd.DataFrame:
+    """แปลงข้อมูลรายชื่อแพทย์และตารางเวรจาก /api/doctors"""
+    if not raw.strip():
+        return pd.DataFrame()
+    rows = json.loads(raw.decode("utf-8", errors="ignore"))
+    parsed = []
+    for r in rows if isinstance(rows, list) else []:
+        info = {}
+        try:
+            info = json.loads(r.get("data") or "{}")
+        except Exception:
+            pass
+        parsed.append({
+            "hospital": r.get("customer_name") or info.get("customer_name"),
+            "doctor_name": info.get("fullName") or info.get("name"),
+            "specialty": info.get("specialty"),
+            "tier": info.get("tier"),
+            "is_ptc": info.get("isPtc"),
+            "target_products": ", ".join(info.get("targetProducts") or []),
+            "prescribe_status": info.get("prescribeStatus"),
+            "best_time": info.get("bestTime"),
+            "room": info.get("room"),
+            "note": info.get("personalNote") or info.get("roleNote"),
+            "schedules": json.dumps(info.get("schedules") or [], ensure_ascii=False),
+        })
+    return pd.DataFrame(parsed)
+
+def _prepare_tasks(raw: bytes) -> pd.DataFrame:
+    """แปลงข้อมูลรายการงาน (Task Manager) จาก /api/tasks"""
+    if not raw.strip():
+        return pd.DataFrame()
+    rows = json.loads(raw.decode("utf-8", errors="ignore"))
+    parsed = []
+    for r in rows if isinstance(rows, list) else []:
+        info = {}
+        try:
+            info = json.loads(r.get("data") or "{}")
+        except Exception:
+            pass
+        parsed.append({
+            "title": info.get("title"),
+            "scope": r.get("scope") or info.get("scope"),
+            "due_date": r.get("due_date") or info.get("dueDate"),
+            "month_key": r.get("month_key") or info.get("monthKey"),
+            "priority": info.get("priority"),
+            "status": r.get("status") or info.get("status"),
+            "customer": info.get("customerName"),
+            "product": info.get("productName"),
+            "notes": info.get("notes"),
+        })
+    return pd.DataFrame(parsed)
+
+def _prepare_stock_checks(raw: bytes) -> pd.DataFrame:
+    """แปลงข้อมูลบันทึกเช็คสต็อกหน้าร้านลูกค้าจาก /api/stock-checks"""
+    if not raw.strip():
+        return pd.DataFrame()
+    rows = json.loads(raw.decode("utf-8", errors="ignore"))
+    parsed = []
+    for r in rows if isinstance(rows, list) else []:
+        cust = r.get("customer_name")
+        cdate = r.get("check_date")
+        for it in r.get("items") or []:
+            parsed.append({
+                "customer": cust,
+                "check_date": cdate,
+                "product": it.get("product"),
+                "subgroup": it.get("subGroup"),
+                "qty": it.get("qty"),
+                "prev_qty": it.get("prevQty"),
+                "avg_per_month": it.get("avgPerMonth"),
+                "exp_date": it.get("expDate"),
+                "note": it.get("note"),
+            })
+    return pd.DataFrame(parsed)
+
 def _prepare_incentive(raw: bytes) -> str:
     """ชีท Incentive เป็นตารางสรุปแบบกว้าง ส่งให้ AI อ่านเป็นข้อความ CSV ที่ตัดช่องว่างออกแล้ว"""
     text = raw.decode("utf-8", errors="ignore")
@@ -234,14 +346,23 @@ def load_data(force: bool = False) -> dict:
 
         sheets = {"sales": None, "invoice": "invoice", "orders": "order tracking",
                   "notes": "Sheet4", "incentive": "incentive"}
-        with ThreadPoolExecutor(max_workers=len(sheets)) as pool:
+        extra_urls = {
+            "stock": f"https://docs.google.com/spreadsheets/d/{STOCK_SHEET_ID}/gviz/tq?tqx=out:csv",
+            "prices": f"{DASHBOARD_URL}api/price-list",
+            "doctors": f"{DASHBOARD_URL}api/doctors",
+            "tasks": f"{DASHBOARD_URL}api/tasks",
+            "stock_checks": f"{DASHBOARD_URL}api/stock-checks",
+        }
+        with ThreadPoolExecutor(max_workers=len(sheets) + len(extra_urls)) as pool:
             futures = {k: pool.submit(_download, v) for k, v in sheets.items()}
+            for k, u in extra_urls.items():
+                futures[k] = pool.submit(_download_url, u)
             raws = {}
             for k, f in futures.items():
                 try:
                     raws[k] = f.result()
                 except Exception as e:
-                    print(f"Sheet download error ({k}): {e}")
+                    print(f"Sheet/API download error ({k}): {e}")
                     raws[k] = b""
 
         if not raws["sales"]:
@@ -259,6 +380,11 @@ def load_data(force: bool = False) -> dict:
             "incentive": incentive_df,
             "incentive_gap": incentive_gap_df,
             "incentive_text": _prepare_incentive(raws["incentive"]) if raws["incentive"] else "",
+            "stock": _prepare_stock(raws["stock"]),
+            "prices": _prepare_prices(raws["prices"]),
+            "doctors": _prepare_doctors(raws["doctors"]),
+            "tasks": _prepare_tasks(raws["tasks"]),
+            "stock_checks": _prepare_stock_checks(raws["stock_checks"]),
         }
         _cache["data"] = data
         _cache["at"] = time.time()
@@ -304,7 +430,23 @@ def build_schema_text(data: dict) -> str:
 6) incentive_gap = Cycle ปัจจุบัน แต่ละกลุ่มสินค้ายังขาดยอดอีกเท่าไหร่ถึงจะถึงขั้น achievement
    คอลัมน์: product_group, cycle, gap_85, gap_90, gap_95, gap_100, gap_105, gap_110 (ค่าติดลบ = ยังขาดอีกกี่บาท, ค่าบวก = เกินแล้ว), incentive_amount (เงิน incentive ที่ได้ตอนนี้)
 
+7) stock = สต็อกสินค้าคงคลังและวันหมดอายุ (Expiry Date / EXP) ของยาแต่ละล็อต ({len(data['stock'])} แถว)
+   คอลัมน์: snapshot_date, location_code (1001=Commercial Goods ขายได้ปกติ, 10RS=Cust.Reservation, 1004=RUD, 10PR=PRN), location_desc, product_group, material_code,
+   product_name (ชื่อยา เช่น {', '.join(data['stock']['product_name'].dropna().unique()[:25]) if len(data['stock']) else '-'}),
+   batch_no (เลขล็อต), expiry_str (วันหมดอายุ เช่น '5/15/2029'), expiry_date (datetime วันหมดอายุ), stock_on_hand (จำนวนในคลัง), stock_available (จำนวนพร้อมขาย)
+
+8) prices = ตารางราคายาและโปรโมชันของแถม (Price List) ({len(data['prices'])} แถว)
+   คอลัมน์: category, code, name, pack_size, channel (HOS / Clinic / Drugstore), net_price, ltd_price, deal_1, deal_2, deal_3, deal_4, min_box_price
+
+9) doctors = ข้อมูลแพทย์ประจำ รพ./คลินิก ({len(data['doctors'])} แถว)
+   คอลัมน์: hospital, doctor_name, specialty, tier, is_ptc, target_products, prescribe_status, best_time, room, note, schedules
+
+10) tasks = รายการงาน/นัดหมายของเซลส์ ({len(data['tasks'])} แถว) คอลัมน์: title, scope, due_date, month_key, priority, status, customer, product, notes
+11) stock_checks = บันทึกเช็คสต็อกหน้าร้านลูกค้า ({len(data['stock_checks'])} แถว) คอลัมน์: customer, check_date, product, subgroup, qty, prev_qty, avg_per_month, exp_date, note
+
 ข้อควรรู้:
+- หากผู้ใช้พิมพ์ชื่อยาสะกดผิดเล็กน้อย (เช่น พิมพ์ 'reinisin' แทนที่จะเป็น 'reminisin') ให้เทียบกับชื่อยาจริงในระบบแล้วใช้คำค้นที่สะกดถูกต้อง (เช่น 'REMINISIN')
+- เวลาถามว่ายาตัวไหน exp (หมดอายุ) เมื่อไหร่ หรือเหลือสต็อกเท่าไหร่ ให้ดูจากตาราง stock โดยแสดงครบทุกคอลัมน์ ['product_name', 'batch_no', 'location_desc', 'expiry_str', 'expiry_date', 'stock_available']
 - ชื่อลูกค้าในตารางมักมีเว้นวรรคหลังคำนำหน้า เช่น "นพ. โกวิทย์ ธาราศักดิ์" เวลาค้นหาชื่อลูกค้าให้ตัดคำนำหน้า (นพ./พญ./ภก./รพ./หจก./บริษัท) ออกแล้วค้นเฉพาะชื่อจริง เช่น .str.contains('โกวิทย์', case=False, na=False, regex=False)
 - ชื่อสินค้าเดียวกันอาจมีหลายรูปแบบ (เช่น MEITHROMAX มีทั้งแบบ Capsule และ Oral Suspension) ถ้าถามว่าสั่งล่าสุดเมื่อไหร่ ให้แสดงวันที่สั่งล่าสุดของทุกรูปแบบสินค้าที่ตรงกับชื่อนั้น พร้อมรายการล่าสุด 5 รายการเรียงตาม inv_date"""
 
@@ -353,6 +495,11 @@ def _run_code(code: str, data: dict):
         "notes": data["notes"].copy(),
         "incentive": data["incentive"].copy(),
         "incentive_gap": data["incentive_gap"].copy(),
+        "stock": data["stock"].copy(),
+        "prices": data["prices"].copy(),
+        "doctors": data["doctors"].copy(),
+        "tasks": data["tasks"].copy(),
+        "stock_checks": data["stock_checks"].copy(),
         "today": pd.Timestamp(agent.now_th().replace(tzinfo=None)).normalize(),
     }
     exec(compile(code, "<sales_query>", "exec"), env)
