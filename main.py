@@ -39,6 +39,7 @@ if sys.platform == "win32":
 
 from config import TELEGRAM_BOT_TOKEN, ALLOWED_USER_ID, validate_config
 import agent
+import sales_data
 
 # ตั้งค่า Logging
 logging.basicConfig(
@@ -246,6 +247,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "กัญญ์เป็นเลขาส่วนตัวและเพื่อนคู่คิดของคุณนะคะ คุยกับกัญญ์ได้เหมือนคุยกับคนจริงๆ เลย!\n\n"
             "• ☀️🔵 **ทุกเช้า 07:30 น.** กัญญ์จะทักมาสรุป **สภาพอากาศ + ข่าวเชลซีจาก 4 สำนักดัง** ให้ฟังอัตโนมัติ\n"
             "• 🦁 พิมพ์ `/chelsea` หรือ *'สรุปข่าวเชลซี'* เพื่อดูข่าวเชลซีล่าสุดตอนนี้ได้เลย\n"
+            "• 📊 ถามข้อมูล Sales Dashboard ได้เลย เช่น *'ยอดขายเดือนนี้เท่าไหร่'* หรือ `/sales`\n"
             "• 🌤️ พิมพ์ `/weather` หรือ *'สรุปอากาศ'* เพื่อดูสภาพอากาศตรงจุดที่คุณอยู่\n"
             "• 📍 **กดปุ่ม 'ส่งตำแหน่งของฉันตอนนี้' ด้านล่าง** เพื่อให้กัญญ์จำพิกัดของคุณไว้เช็คอากาศและหาร้านอร่อยๆ\n"
             "• ⏰ สั่งตั้งเตือนด้วยภาษาพูดได้เลย เช่น *'12.00 เตือนไปกินข้าวหน่อย ทักมารัวๆ เลยนะ'*\n"
@@ -272,6 +274,20 @@ async def chelsea_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(update.message.reply_chat_action(ChatAction.TYPING))
     bubbles = await asyncio.to_thread(agent.generate_chelsea_news_briefing)
     await send_human_bubbles(update, bubbles)
+
+async def sales_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """คำสั่งถามข้อมูลยอดขาย /sales <คำถาม> (ไม่ใส่คำถาม = สรุปภาพรวมเดือนนี้)"""
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        return
+    question = " ".join(context.args) if context.args else "สรุปยอดขายเดือนล่าสุด เทียบกับเดือนก่อนหน้า และ 5 ลูกค้าที่ยอดสูงสุดของเดือนล่าสุด"
+    asyncio.create_task(update.message.reply_chat_action(ChatAction.TYPING))
+    try:
+        reply = await asyncio.to_thread(sales_data.answer_sales_question, user_id, question)
+        await send_safe_reply(update, reply or "ถามเรื่องยอดขาย ลูกค้า สินค้า หรือออเดอร์ได้เลยนะคะ 📊")
+    except Exception as e:
+        logger.error(f"Sales command error: {e}")
+        await update.message.reply_text("แงง กัญญ์เปิดข้อมูล Sales Dashboard ไม่สำเร็จค่ะ ลองใหม่อีกทีนะคะ 🥺")
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """คำสั่งล้างความจำ /reset"""
@@ -502,7 +518,20 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await send_human_bubbles(update, confirm_bubbles)
             return
 
-    # 8. ตอบคำถามปกติแบบมนุษย์ (ส่งเป็นหลายกล่องข้อความ Multi-Bubble)
+    # 8. ตอบคำถามเรื่องยอดขาย/ลูกค้า/ออเดอร์ จาก Sales Dashboard (Google Sheet)
+    if sales_data.is_sales_question(user_id, text):
+        asyncio.create_task(update.message.reply_chat_action(ChatAction.TYPING))
+        try:
+            sales_reply = await asyncio.to_thread(sales_data.answer_sales_question, user_id, text)
+            if sales_reply:
+                await send_safe_reply(update, sales_reply)
+                return
+        except Exception as e:
+            logger.error(f"Sales question error: {e}")
+            await update.message.reply_text("แงง กัญญ์เปิดข้อมูล Sales Dashboard ไม่สำเร็จค่ะ ลองถามใหม่อีกทีนะคะ 🥺")
+            return
+
+    # 9. ตอบคำถามปกติแบบมนุษย์ (ส่งเป็นหลายกล่องข้อความ Multi-Bubble)
     asyncio.create_task(update.message.reply_chat_action(ChatAction.TYPING))
     try:
         reply = await asyncio.to_thread(agent.ask_agent, user_id, text)
@@ -594,6 +623,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("weather", weather_command))
     app.add_handler(CommandHandler("chelsea", chelsea_command))
+    app.add_handler(CommandHandler("sales", sales_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("memo", memo_command))
     app.add_handler(CommandHandler("draw", draw_command))
